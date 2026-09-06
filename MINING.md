@@ -7,6 +7,14 @@ gate is necessary; it is not evidence that a submission will earn rewards.
 This guide covers human-operated mining. Autonomous workflows must also follow
 [MINING_AGENTS.MD](MINING_AGENTS.MD).
 
+The path is: verify the contract → develop and test → register and serve →
+fund credits → commit/reveal → evaluation → confirmation. Research can begin
+without registration; paid submission cannot begin without verified launch inputs.
+
+Use this guide in order on your first attempt. For an existing miner, jump to
+[serving](#6-register-and-serve), [credits and rounds](#7-track-credits-rounds-and-confirmation),
+or [troubleshooting](#attribution-and-troubleshooting).
+
 ## 1. Decide whether this work fits you
 
 Refinery is suited to researchers and engineers who understand tensor operations,
@@ -25,13 +33,16 @@ a competitive advantage.
 | --- | --- |
 | Network / subnet | `finney` / `125` |
 | Authorized validator hotkey | Public SS58 address; must match the local trust pin |
-| Treasury coldkey and current fee | Verified public payment destination and TAO fee |
+| Treasury coldkey and current fee | `5DLu5XrMV8Wt7aSmutxwAT1tNdwXtLxPDHvd5JAiY6WDnnX7`; fee pinned per round |
 | Your registered hotkey and owning coldkey | Identity that serves source and owns evaluation credits |
 | Public endpoint | Reachable IP and TCP port; default port 8091 |
 | Task revision, data manifest and shard access | Reproduce the intended evaluation conditions |
 | Current frontier, adaptive bar and deadlines | Decide whether and when a submission is competitive |
 
-Obtain these from authenticated operator announcements and matching round records.
+The configured public treasury is `5DLu5XrMV8Wt7aSmutxwAT1tNdwXtLxPDHvd5JAiY6WDnnX7`.
+The default reference is `$250/TAO`; the validator adds a 10% margin to its
+estimated full-run cost and pins the resulting TAO fee before commits open.
+Confirm the signed round announcement and live fee before transferring funds.
 Do not infer addresses from examples or pay an address supplied by an unverified
 message. Registration costs and evaluation fees are separate.
 
@@ -61,7 +72,7 @@ The package targets PyTorch 2.8.0 and Bittensor 10.2 to below 11. For a B200
 research worker, use the matching CUDA 12.8 PyTorch wheel:
 
 ```bash
-python -m pip install --index-url https://download.pytorch.org/whl/cu128 'torch==2.8.0'
+python -m pip install --index-url https://download.pytorch.org/whl/cu128 'torch==2.8.0' 'torchvision==0.23.0'
 ```
 
 Read [`sn125/miner_template.py`](sn125/miner_template.py) before editing. Define
@@ -78,6 +89,17 @@ The source limit is 1 MB. Imports and operations are restricted by
 [`sn125/gate.py`](sn125/gate.py). File/network/process access, dynamic execution
 and reflection are restricted. Standard-library `random` is forbidden; supported
 torch RNG is available. Treat generated candidate source as untrusted code.
+
+Before a long run, check these interface invariants:
+
+- Update keys match the parameters being updated; tensors have compatible shapes
+  and devices, and contain finite values.
+- The sign is correct: the harness **adds** the returned update. An SGD-style
+  descent update is `-lr * gradient`, not `lr * gradient`.
+- The optimizer uses the supplied step number and schedule horizon rather than
+  assuming that a short smoke run has the production horizon.
+- Saving and restoring state preserves the next update, including any momentum,
+  statistics and counters required by the method.
 
 ## 4. Check the source without executing it
 
@@ -97,7 +119,10 @@ PY
 
 Next, `python -m sn125 validate-file my_optimizer.py` runs an interface check on
 a CUDA worker. Unlike parsing, this executes candidate code. Use an isolated
-worker without wallet or provider secrets. An interface pass is not a loss result.
+worker without wallet or provider secrets. This command's restricted Python
+loader is not the full production OS isolation boundary. Its “Ready to submit”
+message means only that this interface check
+passed; it is not a loss result, an isolation attestation or a reward qualification.
 
 ## 5. Run controlled research evaluations
 
@@ -111,7 +136,13 @@ Set the following to verified values: `SN125_FINEWEB_DIR`,
 `SN125_FINEWEB_MANIFEST_HASH`. Do not use an unpinned repository revision for
 a production comparison. Dataset and checkpoint binaries are not in this package.
 
+The commands below require these variables to be set; stop if any is missing:
+
 ```bash
+: "${SN125_FINEWEB_DIR:?Set the local shard directory}"
+: "${SN125_FINEWEB_HF_REPO:?Set the verified dataset repository}"
+: "${SN125_FINEWEB_HF_REVISION:?Set the immutable dataset revision}"
+: "${SN125_FINEWEB_MANIFEST_HASH:?Set the verified manifest hash}"
 python -m sn125 stage-shards \
   --data-dir "$SN125_FINEWEB_DIR" \
   --hf-repo "$SN125_FINEWEB_HF_REPO" \

@@ -1,10 +1,15 @@
 # Refinery
 
-### Accelerating Open Intelligence through incentivized research.
+Accelerating Open Intelligence through incentivized research.
 
-Refinery is **Bittensor subnet 125**: an open search for better algorithms for
-training AI. Miners propose optimizers. A shared evaluation measures what they
-achieve within a fixed compute budget. Confirmed improvements earn rewards.
+Refinery is **Bittensor subnet 125**: an incentivized research network for
+improving the algorithms behind language-model training. It connects a global
+pool of contributors to a shared objective: make open models learn more from
+the compute available to them.
+
+Miners submit optimizer code. Validators train and independently score the
+resulting checkpoints under a fixed compute budget. Improvements that pass
+confirmation earn rewards.
 
 **The first research target is gradient descent.** The aim is practical: discover
 update rules that reach lower validation loss with the resources a training run
@@ -14,9 +19,15 @@ already has, then make those discoveries available for others to build on.
 
 ## Why Refinery exists
 
-Model performance is downstream of algorithms and data. Better optimizers are
-one part of a broader opportunity: small advances across a training system can
-compound into meaningful gains in capability and efficiency.
+Model performance is downstream of algorithms and data. The difference between
+training systems need not come from one breakthrough: improvements in update
+rules, architectures, pretraining data and reinforcement-learning environments
+can compound. We believe a sustained, open search across these components can
+help narrow the capability and efficiency gap between open and closed models.
+
+Refinery starts with one measurable part of that ambition. Instead of asking
+contributors to build an entire frontier model, it asks them to improve how
+one learns—and provides a common evaluation and a reward for verified progress.
 
 Refinery brings that research to Bittensor for three reasons:
 
@@ -27,9 +38,25 @@ Refinery brings that research to Bittensor for three reasons:
 - **Bring researchers into the network.** Give optimizer specialists, ML engineers
   and research-agent teams a concrete route into mining through useful discoveries.
 
-The ambition is broad; the initial experiment is deliberately specific. A win on
-this benchmark establishes a result under its recorded conditions. Transfer to
-other models, datasets and training scales remains a research question.
+## Why start with optimizers?
+
+An optimizer determines how a model learns from each batch of data. A better
+update rule can reach lower validation loss with the same compute budget—or
+reach a useful loss sooner. That makes optimizer research a concrete first
+target: contributors can change one component and measure its effect under a
+shared training contract.
+
+Our two starting beliefs are that bounded training runs can identify methods
+worth testing at larger scales, and that Bittensor's global talent pool can
+discover those methods. LLM research agents may broaden that pool when paired
+with useful feedback, enough compute and the right constraints. The subnet's
+results will test those beliefs.
+
+We believe this benchmark is our best practical way to measure optimizer
+performance within the resources of an evaluation run. Transfer to other
+models, datasets and training scales still needs to be measured. Data selection
+and other training components are future research directions, not current
+mining tasks.
 
 ## What miners do
 
@@ -44,6 +71,10 @@ Mining is **algorithm research**, not supplying GPUs to the validator. The miner
 service serves source code; the validator runs the scored training jobs. A GPU
 is not required simply to serve a submission, but meaningful local training
 experiments require suitable compute.
+
+The intended output is reusable research: optimizer source, training evidence
+and results that other researchers can investigate. A subnet benchmark win is
+a starting point for broader evaluation, not a claim of universal superiority.
 
 ## The initial evaluation
 
@@ -70,17 +101,27 @@ size, with a 14-day half-life. Credit determines how rewards are shared, while
 recent network progress determines how much miner emission is paid rather than
 burned. The launch burn floor is 0% from day one—not a guaranteed payout.
 
-The first research review is planned after six weeks. There is no automatic
-pause. See [mining economics](MINING.md#costs-and-expected-value) for costs and
+The initial optimizer search is planned for at least six weeks, followed by a
+review of the results and a discussion of whether to continue, revise the task,
+or pause for research. The code does not schedule an automatic pause.
+See [mining economics](MINING.md#costs-and-expected-value) for costs and
 the distinction between a calculated weight and realized revenue.
+
+### Evaluation fee reference
+
+The public launch treasury is `5DLu5XrMV8Wt7aSmutxwAT1tNdwXtLxPDHvd5JAiY6WDnnX7`.
+The default TAO reference is `$250/TAO`, with a 10% margin over the estimated
+full-run rental cost. The fee is calculated at startup and pinned for each
+round. Never transfer funds until the signed round announcement confirms the
+fee and treasury address.
 
 ## Before you start
 
-This is a production-source distribution, **not proof of an active deployment**.
+This source release is **not proof of an active deployment**.
 The included configuration still has a placeholder authorized validator hotkey
 and an unset launch timestamp. Obtain the verified production identity, treasury,
 fee, task/data pins and current frontier before registering or transferring funds.
-The September 7, 2026 launch announcement does not replace those checks.
+An announced launch date does not replace those checks.
 
 Use Linux and Python 3.12 in a dedicated environment:
 
@@ -91,10 +132,11 @@ python -m pip install -r requirements.txt
 python -m sn125 --help
 ```
 
-Next, follow [MINING.md](MINING.md). Agents should read
-[MINING_AGENTS.MD](MINING_AGENTS.MD) before running tools or spending.
+Next, follow [MINING.md](MINING.md): build a candidate, check it without executing
+it, then run isolated experiments before considering a paid submission. Agents
+should read [MINING_AGENTS.MD](MINING_AGENTS.MD) before running tools or spending.
 
-## What's in this repository
+## Production code
 
 - `sn125/neuron.py`, `miner_template.py`: miner service, protocol and optimizer interface.
 - `sn125/roundsm/`, `payments/`: round orchestration and evaluation-credit accounting.
@@ -104,8 +146,8 @@ Next, follow [MINING.md](MINING.md). Agents should read
 - `sn125/publisher.py`, `dashboard/data.py`, `dashboard/snapshot.py`: artifact publication.
 - `sn125/verify.py`, `prove_authorship.py`: verification and source attribution.
 
-The website, tests, temporary scripts, datasets, checkpoints and live round records
-are not bundled. The dashboard modules here generate publication data; they do
+The production ZIP excludes the website, tests, temporary scripts, datasets,
+checkpoints and live round records. The dashboard modules here generate publication data; they do
 not include a website or web server. Production R2 storage remains private.
 
 Keep signing keys and provider credentials outside source control and outside

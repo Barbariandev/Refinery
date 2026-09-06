@@ -10,7 +10,7 @@ def _check_no_duplicate(label: str):
     p = my_pid
     for _ in range(5):
         try:
-            with open(f'/proc/{p}/stat') as f:
+            with open(f"/proc/{p}/stat") as f:
                 pp = int(f.read().split()[3])
         except (OSError, ValueError, IndexError):
             break
@@ -25,7 +25,8 @@ def _check_no_duplicate(label: str):
     for line in out.strip().split('\n'):
         pid = int(line.strip())
         if pid not in exclude:
-            print(f"ERROR: refusing to spawn {label}: PID {pid} already running (`pgrep -f 'python.*-m sn125'`). Kill it first.", file=sys.stderr)
+            print(f"ERROR: refusing to spawn {label}: PID {pid} already running "
+                  f"(`pgrep -f 'python.*-m sn125'`). Kill it first.", file=sys.stderr)
             sys.exit(1)
 
 def _raise_nofile_limit() -> None:
@@ -61,8 +62,9 @@ def main():
     p_val.add_argument('--provider', '--providers', dest='provider', default='', help="Ordered comma-separated provider failover chain for B200 rentals (e.g. 'lambda,targon': rent from the first provider with capacity, fail over down the chain, pause only when all are dry). Default: SN125_CLOUD_PROVIDERS env, legacy SN125_CLOUD_PROVIDER, then 'runpod,lambda'. 'aws' (standardized p6-b200.48xlarge, opt-in — see cloud_aws.py) is trusted; 'lium' is refused for scoring (untrusted marketplace hosts).")
     p_val.add_argument('--burn-fraction-floor', type=float, default=None, help='Override sn125.config.LAUNCH_BURN_FRACTION_FLOOR. Default uses config.py; with no frontier winner, emission still burns 100%%.')
     p_val.add_argument('--audit-dir', default='', help="Directory for per-round validator JSONL audit logs (default: sibling 'audit' directory next to rounds).")
-    p_val.add_argument('--treasury-coldkey', default=None, help='SS58 of the treasury coldkey miners pay the round fee to (credits are granted on observed finalized transfers).')
-    p_val.add_argument('--round-fee-tao', type=float, default=0.0, help='Per-round evaluation fee in TAO (pinned before each commit window; 1 credit = 1 submission).')
+    p_val.add_argument('--treasury-coldkey', default=None, help='SS58 of the treasury coldkey miners pay the round fee to (defaults to the configured public treasury address).')
+    p_val.add_argument('--round-fee-tao', type=float, default=None, help='Per-round evaluation fee in TAO. If omitted, calculate from the estimated full-run cost plus 10%% margin.')
+    p_val.add_argument('--tao-usd-price', type=float, default=None, help='TAO/USD reference for automatic fee calculation (default: sn125/tao_price.json, currently $250).')
     p_val.add_argument('--finality-depth', type=int, default=10, help='Blocks behind chain head treated as final before crediting a treasury transfer (default: 10).')
     p_vf = sub.add_parser('validate-file', help='Check optimizer file passes sandbox')
     p_vf.add_argument('file', help='Path to optimizer .py file')
@@ -140,10 +142,10 @@ def main():
         Miner(wallet, port=args.port, optimizer_path=args.optimizer).run()
     elif args.command == 'validate':
         _check_no_duplicate('validate')
-        if not args.treasury_coldkey:
+        from . import config
+        treasury_coldkey = args.treasury_coldkey or config.TREASURY_COLDKEY
+        if not treasury_coldkey:
             parser.error('validate requires --treasury-coldkey')
-        if args.round_fee_tao <= 0:
-            parser.error('validate requires --round-fee-tao > 0')
         from . import settings
         from .cloud import ensure_scoring_providers
         from .neuron import CommitHash, GetSubmission, Validator
@@ -160,15 +162,34 @@ def main():
         try:
             tasks = production_tasks(total_steps=PROD_CONFIRM_STEPS)
         except FileNotFoundError as e:
-            parser.error(f'production shards required for validate: {e}')
-        print(f'[validate] production task → {tasks[0].task_id} seq{tasks[0].sequence_length} manifest {tasks[0].data_manifest[:16]}')
-        print(f'[validate] provider failover chain → {','.join(providers)} (B200-only; round pauses when every provider is dry)')
+            parser.error(f"production shards required for validate: {e}")
+        print(f"[validate] production task → {tasks[0].task_id} "
+              f"seq{tasks[0].sequence_length} manifest {tasks[0].data_manifest[:16]}")
+        print(f"[validate] provider failover chain → {','.join(providers)} "
+              f"(B200-only; round pauses when every provider is dry)")
         wallet = bt.Wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
         validator = Validator(wallet=wallet, netuid=args.netuid, network=args.network, set_weights=args.set_weights, tasks=tasks, num_trials=1, submission_timeout=args.timeout, mode='prod', backend=','.join(providers), cloud_resource=args.resource, audit_dir=args.audit_dir, burn_fraction_floor=args.burn_fraction_floor)
+        if args.round_fee_tao is None:
+            from .cloud import SKU_COSTS, SUBMISSION_MARGIN
+            from .pricing import fee_tao_for_cost, tao_usd_price
+            if validator._cloud_orch is not None:
+                hourly = validator._cloud_orch._cost_per_hour(args.resource)
+            else:
+                hourly = SKU_COSTS.get(args.resource, 20.0)
+            estimated_cost = (float(args.timeout) + SUBMISSION_MARGIN) / 3600.0 * float(hourly)
+            price = tao_usd_price() if args.tao_usd_price is None else args.tao_usd_price
+            try:
+                args.round_fee_tao = fee_tao_for_cost(estimated_cost, price_usd=price)
+            except ValueError as e:
+                parser.error(str(e))
+            print(f"[validate] automatic fee → {args.round_fee_tao:.3f} TAO "
+                  f"(estimated ${estimated_cost:.2f} run × 1.10 ÷ ${price:.2f}/TAO)")
+        if args.round_fee_tao <= 0:
+            parser.error('validate requires --round-fee-tao > 0')
         subtensor = validator.subtensor or bt.Subtensor(network=args.network)
-        view = BittensorChainView.from_subtensor(subtensor, args.treasury_coldkey, finality_depth=args.finality_depth)
+        view = BittensorChainView.from_subtensor(subtensor, treasury_coldkey, finality_depth=args.finality_depth)
         validator.payment_registry = PaymentRegistry(view)
-        validator.treasury_coldkey = args.treasury_coldkey
+        validator.treasury_coldkey = treasury_coldkey
         validator.round_fee_rao = int(round(args.round_fee_tao * RAO_PER_TAO))
         validator.cloud_resource = args.resource
         validator.commit_synapse_cls = CommitHash
@@ -182,10 +203,11 @@ def main():
             client = make_cloud_client(args.backend, args.timeout)
             orch = TargonOrchestrator(client=client, resource=args.resource, timeout=args.timeout)
             orch.initialize()
-            print(f'Calibration probe on {args.backend} ({args.resource}): {args.model} seq={args.seq} batch={args.batch} steps={args.steps}...')
+            print(f"Calibration probe on {args.backend} ({args.resource}): {args.model} "
+                  f"seq={args.seq} batch={args.batch} steps={args.steps}...")
             result = orch.calibrate_remote(model=args.model, seq=args.seq, batch=args.batch, steps=args.steps, warmup=args.warmup, target_hours=args.target_hours, timeout=args.timeout, spend_ledger=args.spend_ledger, empty_cache_every=args.empty_cache_every, profile=args.profile, flash=args.flash, nondet=args.nondet, compile_model=args.compile_model, chunked_ce=args.chunked_ce, fp8=args.fp8)
             status = orch.get_status()
-            print(f'\nCloud cost: ${status['daily_spend']:.2f} today')
+            print(f"\nCloud cost: ${status['daily_spend']:.2f} today")
         else:
             if args.profile:
                 os.environ['SN125_PROFILE'] = '1'
@@ -196,7 +218,7 @@ def main():
             from .calibrate import run_probe
             result = run_probe(args.model, args.seq, args.batch, args.steps, warmup_steps=args.warmup, drop_warmup=args.drop_warmup, use_amp=not args.no_amp, target_hours=args.target_hours, empty_cache_every=args.empty_cache_every, compile_model=args.compile_model, chunked_ce=args.chunked_ce, fp8=args.fp8)
         if result.get('failed'):
-            print(f'FAILED: {result.get('error', 'unknown')}')
+            print(f"FAILED: {result.get('error', 'unknown')}")
             sys.exit(1)
         if args.backend == 'local':
             print('CALIBRATION_RESULT ' + _json.dumps(result), flush=True)
@@ -205,7 +227,9 @@ def main():
                 _json.dump(result, f, indent=2)
         print('\n=== Calibration ===')
         print(_json.dumps(result, indent=2))
-        print(f'\n→ N={result.get('computed_N')} step_time={result.get('median_step_time_s')}s tokens={result.get('projected_tokens')} chinchilla_ratio={result.get('chinchilla_ratio')} mfu={result.get('mfu')}')
+        print(f"\n→ N={result.get('computed_N')} step_time={result.get('median_step_time_s')}s "
+              f"tokens={result.get('projected_tokens')} chinchilla_ratio={result.get('chinchilla_ratio')} "
+              f"mfu={result.get('mfu')}")
     elif args.command == 'box-probe':
         from .boxprobe import format_result, run_box_probe
         result = run_box_probe(warmup_steps=args.warmup, measure_steps=args.steps)
@@ -214,24 +238,24 @@ def main():
         from .sandbox import validate_source, load_optimizer_sandboxed, SandboxViolation
         from .references import extract_hparams
         src = Path(args.file).read_text()
-        print(f'Source: {len(src)} bytes ({len(src.encode())} encoded)')
+        print(f"Source: {len(src)} bytes ({len(src.encode())} encoded)")
         violations = validate_source(src)
         if violations:
-            print(f'FAILED — {len(violations)} violation(s):')
+            print(f"FAILED — {len(violations)} violation(s):")
             for v in violations:
-                print(f'  ✗ {v}')
+                print(f"  ✗ {v}")
             sys.exit(1)
         print('AST validation: PASS')
         try:
             cls = load_optimizer_sandboxed(src)
             print('Sandbox load:   PASS')
         except SandboxViolation as e:
-            print(f'Sandbox load:   FAIL — {e}')
+            print(f"Sandbox load:   FAIL — {e}")
             sys.exit(1)
         hp = extract_hparams(src)
         hp_sc = extract_hparams(src, {'use_pretrained': False})
-        print(f'HPARAMS:        lr={hp['lr']:.1e} wd={hp.get('weight_decay', 0.01):.1e}')
-        print(f'  scratch:      lr={hp_sc['lr']:.1e} wd={hp_sc.get('weight_decay', 0.01):.1e}')
+        print(f"HPARAMS:        lr={hp['lr']:.1e} wd={hp.get('weight_decay',0.01):.1e}")
+        print(f"  scratch:      lr={hp_sc['lr']:.1e} wd={hp_sc.get('weight_decay',0.01):.1e}")
         import torch
         pg = [{'params': [('w', (32, 32), torch.float32)], 'lr': hp['lr'], 'weight_decay': hp.get('weight_decay', 0.01)}]
         cfg = {'total_steps': 100, 'warmup_steps': 5, 'decay_fraction': 0.2, 'max_grad_norm': 1.0}
@@ -243,7 +267,7 @@ def main():
             assert 'w' in u and u['w'].shape == (32, 32), 'Bad update shape'
             print('Functional test: PASS (init + step OK)')
         except Exception as e:
-            print(f'Functional test: FAIL — {e}')
+            print(f"Functional test: FAIL — {e}")
             sys.exit(1)
         print('\nReady to submit.')
     elif args.command == 'prod-eval':

@@ -64,6 +64,15 @@ trusted signing workflow for its owning coldkey. Optional HF, compute and LLM
 credentials are the operator's own least-privilege credentials.
 
 You do not need the validator's R2 writer token, provider keys or wallet secrets.
+
+| Input | Classification | Agent handling |
+| --- | --- | --- |
+| Validator hotkey and treasury address | Public identity pins | Verify against the authenticated release; never substitute examples |
+| Own wallet/hotkey names and public addresses | Local identifiers / public metadata | Record for reconciliation; names are not signing keys |
+| Own hotkey signing material | Secret | Use only through the approved miner/signing workflow |
+| Own coldkey signing material | Secret | Keep on the trusted signing machine, outside research workers |
+| HF read token, cloud key, LLM API key | Optional secrets | Use operator-owned, scoped credentials only where needed |
+
 Never read another operator's `.env`, copy a coldkey onto an evaluation worker,
 or put credentials in submissions, Git, reports or model prompts. Use approved
 secret injection rather than printing values.
@@ -101,6 +110,40 @@ Use unique local output directories. Do not overwrite a prior candidate's record
 The production archive has no mock mode, test suite, website or bundled data.
 Commands that rent compute, advertise endpoints, register wallets or transfer
 funds require the relevant authorization; this guide does not provide it.
+
+## Evidence required to advance
+
+| Stage | Required evidence | Does not establish |
+| --- | --- | --- |
+| Source accepted | No source-gate violations | Correct execution or competitive loss |
+| Smoke passed | Successful result, finite outputs, valid checkpoint/scoring metadata | Production-horizon performance |
+| Submission ready | Matched experiments, verified live target, rights to publish, approved spend | Guaranteed selection or reward |
+| Evaluation qualified | Round result strictly clears its recorded bar | Confirmed progress |
+| Confirmation passed | Same-source confirmation and recorded frontier event | Realized chain revenue |
+| Revenue received | Verified chain settlement attributable to the miner | Profit after research and operating costs |
+
+Never collapse these stages into a single `success` flag. Record the stage,
+artifact location, source hash and unresolved checks. A timeout or missing result
+is `unknown` until the job's actual status is checked; do not automatically rent
+another worker or pay again.
+
+## Command reference
+
+Run from the repository root. Follow the isolation and dataset setup in
+[MINING.md](MINING.md); these commands do not supply missing credentials or pins.
+
+| Action | Command | Side effects |
+| --- | --- | --- |
+| Discover commands | `python -m sn125 --help` | No intended cloud or chain writes |
+| Parse a candidate | Source-gate Python snippet in `MINING.md` | Reads source; does not execute it |
+| Check the interface | `python -m sn125 validate-file candidate.py` | Executes untrusted candidate code on CUDA; isolated worker required |
+| Evaluate | `python -m sn125 prod-eval --help`, then the bounded command in `MINING.md` | Consumes compute and writes results |
+| Serve source | `test -f candidate.py && python -m sn125 mine --wallet-name W --wallet-hotkey H --optimizer candidate.py` | Uses the hotkey and opens a listener; does not advertise it |
+| Verify records | `python -m sn125.verify --rounds-dir PATH` | Reads records; inspect skipped checks |
+
+Registration, endpoint advertisement and evaluation-credit funding are separate
+on-chain actions. Use the verified wallet workflow in the mining guide; never
+invent a payment command or substitute a sample treasury address.
 
 ## Decision record
 

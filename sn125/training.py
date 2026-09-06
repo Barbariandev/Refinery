@@ -625,6 +625,7 @@ def train_and_eval(
     last_loss_val = float("nan")
     _accum_persist = 0
     step = -1
+    completed_steps = 0
     t0 = time.time()
 
     budget_mode = compute_budget_seconds > 0
@@ -678,11 +679,20 @@ def train_and_eval(
             return
         _frac_elapsed = (time.time() - t0) / compute_budget_seconds
         if stop_at_total_steps and total_steps > 0:
-            _frac_elapsed = max(_frac_elapsed, (at_step + 1) / total_steps)
+            _frac_elapsed = max(_frac_elapsed, at_step / total_steps)
         for _q in _quartiles:
             if _q not in _quartiles_done and _frac_elapsed >= _q:
                 _quartiles_done.add(_q)
                 _emit_quartile(_q, at_step)
+
+    def _budget_exhausted() -> bool:
+        if not budget_mode or time.time() - t0 < compute_budget_seconds:
+            return False
+        _check_quartiles(completed_steps)
+        _progress_event("train.budget_stop", step=int(completed_steps),
+                        elapsed_s=float(time.time() - t0),
+                        budget_s=float(compute_budget_seconds))
+        return True
 
     _progress = bool(os.environ.get("SN125_PROGRESS"))
     _hb_interval = float(os.environ.get("SN125_PROGRESS_INTERVAL", "60"))
@@ -718,6 +728,8 @@ def train_and_eval(
             _prof[name] = _prof.get(name, 0.0) + (time.time() - _pt)
 
     for step in step_source:
+        if _budget_exhausted():
+            break
         _now = time.time()
         if _prev_iter is not None:
             iter_times.append(_now - _prev_iter)
@@ -755,6 +767,9 @@ def train_and_eval(
             model.train()
 
         _check_quartiles(step)
+
+        if _budget_exhausted():
+            break
 
         if not train_data:
             return _fail_curve(eval_curve, train_curve, time.time() - t0, "No training data")
@@ -865,17 +880,6 @@ def train_and_eval(
             return _fail_curve(eval_curve, train_curve, time.time() - t0,
                                f"Total time {time.time()-t0:.0f}s > {max_total_time}s limit")
 
-        if compute_budget_seconds > 0 and time.time() - t0 >= compute_budget_seconds:
-            _check_quartiles(step)
-            break
-        if budget_mode and stop_at_total_steps and total_steps > 0 and step + 1 >= total_steps:
-            _check_quartiles(step)
-            _progress_event("train.horizon_cap", step=int(step + 1),
-                            total_steps=int(total_steps),
-                            elapsed_s=float(time.time() - t0),
-                            budget_s=float(compute_budget_seconds))
-            break
-
         if memory_check_due and is_cuda:
             torch.cuda.synchronize()
         if memory_check_due:
@@ -922,7 +926,18 @@ def train_and_eval(
                         for p, u in zip(target_params, update_tensors):
                             p.add_(u * warmup_scale)
 
-    final_step = step + 1
+        completed_steps = step + 1
+        if _budget_exhausted():
+            break
+        if budget_mode and stop_at_total_steps and total_steps > 0 and completed_steps >= total_steps:
+            _check_quartiles(completed_steps)
+            _progress_event("train.horizon_cap", step=int(completed_steps),
+                            total_steps=int(total_steps),
+                            elapsed_s=float(time.time() - t0),
+                            budget_s=float(compute_budget_seconds))
+            break
+
+    final_step = completed_steps
     if is_cuda:
         torch.cuda.reset_peak_memory_stats()
     model.eval()
@@ -1677,6 +1692,8 @@ def _make_safe_env() -> dict:
     safe_env["HF_HUB_OFFLINE"] = "1"
     safe_env["TRANSFORMERS_OFFLINE"] = "1"
     safe_env["HF_DATASETS_OFFLINE"] = "1"
+    safe_env["HF_HOME"] = settings.hf_home()
+    safe_env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
     safe_env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     safe_env["OPENBLAS_NUM_THREADS"] = "1"
     safe_env["MKL_NUM_THREADS"] = "1"
@@ -2129,6 +2146,5 @@ def cleanup_data_cache(max_age_s: float = 3600):
                     os.unlink(fp)
             except OSError:
                 pass
-
 
 

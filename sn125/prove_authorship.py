@@ -43,6 +43,11 @@ CLAIM_VERSION = 1
 _UNSIGNED_FIELDS = frozenset({"signature"})
 
 
+def _valid_code_hash(value) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdefABCDEF" for c in value))
+
+
 def source_code_hash(source: str) -> str:
     """The submission identifier used across rounds/attestations: sha256(source)."""
     return hashlib.sha256(source.encode()).hexdigest()
@@ -59,7 +64,7 @@ def build_claim(hotkey_ss58: str, code_hash: str, *, round_id: str = "",
     """Assemble the unsigned claim body."""
     if not hotkey_ss58:
         raise ValueError("hotkey_ss58 is required")
-    if not code_hash or len(code_hash) != 64:
+    if not _valid_code_hash(code_hash):
         raise ValueError(f"code_hash must be a sha256 hex digest, got {code_hash!r}")
     return {
         "version": CLAIM_VERSION,
@@ -90,12 +95,22 @@ def verify_claim(claim: dict, *, source: str | None = None,
       3. source match (only when ``source`` given): sha256(source) == code_hash
     """
     report: dict = {"ok": False, "checks": {}}
+    if not isinstance(claim, dict):
+        report["checks"]["structure"] = "claim must be a JSON object"
+        return report
 
     required = ("version", "kind", "hotkey", "code_hash", "signature")
     missing = [k for k in required if not claim.get(k)]
-    structural = not missing and claim.get("kind") == "sn125_authorship_claim"
+    invalid = list(missing)
+    if claim.get("kind") != "sn125_authorship_claim":
+        invalid.append("kind")
+    if type(claim.get("version")) is not int or claim["version"] != CLAIM_VERSION:
+        invalid.append("version")
+    if not _valid_code_hash(claim.get("code_hash")):
+        invalid.append("code_hash")
+    structural = not invalid
     report["checks"]["structure"] = (
-        "ok" if structural else f"missing/invalid fields: {missing or ['kind']}")
+        "ok" if structural else f"missing/invalid fields: {sorted(set(invalid))}")
 
     sig_ok = False
     if structural:

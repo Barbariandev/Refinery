@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 
+TREASURY_COLDKEY = "5DLu5XrMV8Wt7aSmutxwAT1tNdwXtLxPDHvd5JAiY6WDnnX7"
 
 AUTHORIZED_VALIDATOR_HOTKEY = "CHANGE_ME_SN125_PRODUCTION_VALIDATOR_HOTKEY"
 

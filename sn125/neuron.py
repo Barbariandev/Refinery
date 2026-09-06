@@ -10,7 +10,7 @@ the frontier reward path, round persistence, and attestation.
 import hashlib, json, logging, math, os, time, traceback
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar, Optional
 
 import bittensor as bt
 
@@ -92,6 +92,7 @@ def _normalize_checkpoints(cps) -> list:
 
 class GetSubmission(bt.Synapse):
     """Validator requests a miner's optimizer source for a round."""
+    required_hash_fields: ClassVar[tuple[str, ...]] = ("round_id",)
     round_id: str = ""
     source_code: str = ""
     code_hash: str = ""
@@ -100,6 +101,7 @@ class GetSubmission(bt.Synapse):
 
 class CommitHash(bt.Synapse):
     """Miner pre-commits optimizer hash before seeing the reveal seed."""
+    required_hash_fields: ClassVar[tuple[str, ...]] = ("round_id",)
     round_id: str = ""
     code_hash: str = ""
 
