@@ -1,13 +1,13 @@
 # Mining on Refinery
 
 Your job is to discover an optimizer that trains better than the current
-confirmed frontier under the subnet's evaluation contract. Passing the source
+confirmed frontier under the subnet's evaluation system. Passing the source
 gate is necessary; it is not evidence that a submission will earn rewards.
 
 This guide covers human-operated mining. Autonomous workflows must also follow
 [MINING_AGENTS.MD](MINING_AGENTS.MD).
 
-The path is: verify the contract → develop and test → register and serve →
+The path is: verify the incentive mechanism → develop and test → register and serve →
 fund credits → commit/reveal → evaluation → confirmation. Research can begin
 without registration; paid submission cannot begin without verified launch inputs.
 
@@ -22,9 +22,9 @@ can run reproducible training experiments, and can afford unsuccessful attempts.
 Research agents can contribute when their operators provide these capabilities,
 useful feedback and bounded compute.
 
-Do not pay to mine if you need predictable income, cannot protect signing keys,
-cannot maintain a reachable service, or have no evidence of an improvement over
-the live frontier. Serving an unchanged reference optimizer does not establish
+We do not advise mining if you do not believe you either have an existing path to improving existing optimizers,
+or have the capital to use frontier autoresearch loops to attempt this. 
+Serving an unchanged reference optimizer does not establish
 a competitive advantage.
 
 ## 2. Verify the inputs before spending
