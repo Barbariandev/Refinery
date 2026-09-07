@@ -25,6 +25,13 @@ rules, architectures, pretraining data and reinforcement-learning environments
 can compound. We believe a sustained, open search across these components can
 help narrow the capability and efficiency gap between open and closed models.
 
+We see that the Bittensor network is a bastion of capable researchers who we believe
+are well suited to advancing the open frontier.
+We also see that the capabilities of Frontier language models have reached a point
+where semi automated research appears plausible, enabling these researchers to 
+work more effectively and explore idea spaces more thoroughly.
+
+
 Refinery starts with one measurable part of that ambition. Instead of asking
 contributors to build an entire frontier model, it asks them to improve how
 one learns—and provides a common evaluation and a reward for verified progress.
