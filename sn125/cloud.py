@@ -35,9 +35,10 @@ def _load_targon_api_key() -> str:
     1. TARGON_API_KEY env var (preferred for production / supervised runs)
     2. ~/.sn125/targon_api_key (must be chmod 600; fails loudly if world/group readable)
 
-    Returns "" if neither is found, with a loud WARNING so a misconfigured validator
-    doesn't silently no-op. Callers that actually hit the API will get a 401 and
-    surface a clear error.
+    Returns "" if neither is found. Targon is not in the default provider chain
+    (settings.DEFAULT_CLOUD_PROVIDER_CHAIN), so a missing key is the normal
+    state and is NOT warned about here; ``TargonClient`` raises a clear error
+    if a Targon rental is actually requested without one.
     """
     load_dotenv()
     env_val = os.environ.get("TARGON_API_KEY", "").strip()
@@ -55,11 +56,6 @@ def _load_targon_api_key() -> str:
         val = key_file.read_text().strip()
         if val:
             return val
-
-    log.warning(
-        "No Targon API key found. Set TARGON_API_KEY env var OR write the key to "
-        "~/.sn125/targon_api_key (chmod 600). Cloud-backed evaluations will fail with 401."
-    )
     return ""
 
 
@@ -1342,12 +1338,15 @@ class TargonOrchestrator:
     def _prod_shard_env(self) -> dict:
         """Remote shard-staging env. Do not forward a local SN125_FINEWEB_DIR.
 
-        Secret hygiene: the worker box runs MINER code, so only a READ-scoped HF
-        token may ever reach it (needed to download the shard dataset). The
-        preferred source is SN125_FINEWEB_HF_READ_TOKEN; HF_TOKEN /
-        HUGGINGFACE_HUB_TOKEN are forwarded as-is (operator must scope them
-        read-only). HF_WRITE_TOKEN is NEVER forwarded — uploads from the box go
-        through short-TTL presigned PUT URLs instead (_upload_checkpoints)."""
+        Token precedence for the box's shard download (the dataset repo is
+        private): SN125_FINEWEB_HF_READ_TOKEN (the properly scoped read token),
+        else an explicit HF_TOKEN / HUGGINGFACE_HUB_TOKEN, else HF_WRITE_TOKEN
+        as the last-resort fallback so a validator whose .env only carries the
+        write token can still stage shards instead of failing the round. The
+        box runs miner code under the OS sandbox / egress lockdown, so prefer
+        the read-scoped token whenever it is configured; the fallback is
+        logged once. Checkpoint uploads from the box never use an HF token —
+        they go through short-TTL presigned PUT URLs (_upload_checkpoints)."""
         load_dotenv()
         env = {"HF_HUB_DISABLE_XET": "1"}
         remote_dir = os.environ.get("SN125_TARGON_FINEWEB_DIR", "").strip()
@@ -1371,10 +1370,16 @@ class TargonOrchestrator:
         read_token = os.environ.get("SN125_FINEWEB_HF_READ_TOKEN", "").strip()
         if read_token:
             env["HF_TOKEN"] = read_token
-        if "HF_TOKEN" not in env and os.environ.get("HF_WRITE_TOKEN", "").strip():
-            log.warning("HF_WRITE_TOKEN is set but will NOT be forwarded to the "
-                        "worker box; set SN125_FINEWEB_HF_READ_TOKEN (read-only "
-                        "scope) if the shard repo is private.")
+        elif "HF_TOKEN" not in env:
+            write_token = os.environ.get("HF_WRITE_TOKEN", "").strip()
+            if write_token:
+                env["HF_TOKEN"] = write_token
+                if not getattr(self, "_hf_write_fallback_logged", False):
+                    self._hf_write_fallback_logged = True
+                    log.info("SN125_FINEWEB_HF_READ_TOKEN not set; forwarding "
+                             "HF_WRITE_TOKEN to the worker box for shard staging "
+                             "(set a read-scoped SN125_FINEWEB_HF_READ_TOKEN to "
+                             "narrow it).")
         return env
 
     def _stage_prod_shards(self, wrk_uid: str, *, audit=None,

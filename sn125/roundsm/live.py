@@ -5,6 +5,9 @@ as an injectable function so the whole 24h round loop is unit-testable on CPU.
 CLI command calls it directly. It owns the per-round orchestration that the
 lower layers were built for:
 
+    at start-up:
+      record the fee in force -> catch the credit ledger up to the finalized
+      head (backfill) -> start the continuous payment watcher (payments/watch.py)
     per 24h round:
       pin the round fee  ->  sync credits from observed treasury transfers
       build RoundFSM + adapters (commit/reveal transport, source gate, cloud eval)
@@ -468,6 +471,7 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
     if getattr(validator, "set_weights_enabled", False):
         weight_refresh_stop = _start_weight_refresh(validator)
     publisher = _start_artifact_publisher(validator)
+    payment_watch_stop = _start_payment_watcher(validator, reg, fee_rao)
     while max_rounds is None or round_num < max_rounds:
         round_start = clock()
         round_id = f"round_{round_num:06d}_{int(round_start)}_{vhk}"
@@ -502,10 +506,13 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                        ])
 
             reg.pin_fee(round_id, fee_rao)
-            granted = reg.sync()
-            log.info("  fee pinned %d rao; synced %d treasury transfer(s)", fee_rao, granted)
+            granted = _sync_payments(reg)
+            log.info("  fee pinned %d rao; synced %d treasury transfer(s); %d funded coldkey(s)",
+                     fee_rao, granted, len(_registry_balances(reg)))
             audit_emit(audit, "payments.synced", fee_rao=fee_rao,
                        granted_transfers=granted,
+                       balances=_registry_balances(reg),
+                       ledger_path=str(getattr(reg, "store_path", "") or ""),
                        treasury_coldkey=getattr(validator, "treasury_coldkey", ""))
 
             cfg = _round_config(validator, round_id, fee_rao,
@@ -699,11 +706,76 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                 sleep(remaining)
     if weight_refresh_stop is not None:
         weight_refresh_stop.set()
+    if payment_watch_stop is not None:
+        payment_watch_stop.set()
     if publisher is not None:
         try:
             publisher.stop(flush=True)
         except Exception as e:
             log.warning("artifact publisher shutdown failed: %s", e)
+
+
+def _sync_payments(reg) -> int:
+    """Catch the registry up to the finalized head (all chunks), or one plain
+    ``sync`` for registries/test doubles without ``sync_to_head``."""
+    to_head = getattr(reg, "sync_to_head", None)
+    return int(to_head() if to_head is not None else reg.sync())
+
+
+def _registry_balances(reg) -> dict:
+    getter = getattr(reg, "balances", None)
+    try:
+        return dict(getter()) if getter is not None else {}
+    except Exception:
+        return {}
+
+
+def _payment_scan_interval(validator) -> float:
+    """Seconds between background treasury scans: ``validator.payment_scan_s``,
+    else ``SN125_PAYMENT_SCAN_S``, else the watcher default. <= 0 disables."""
+    from ..payments.watch import DEFAULT_SCAN_INTERVAL_S, SCAN_INTERVAL_ENV
+    explicit = getattr(validator, "payment_scan_s", None)
+    if explicit is not None:
+        return float(explicit)
+    return settings.env_float(SCAN_INTERVAL_ENV, DEFAULT_SCAN_INTERVAL_S)
+
+
+def _start_payment_watcher(validator, reg, fee_rao: int):
+    """Bring the credit ledger current BEFORE the first round and keep it
+    current for the validator's lifetime.
+
+    1. Record ``fee_rao`` as the fee in force so deposits can be credited
+       before the first round pin (and after a restart with a new fee).
+    2. Blocking catch-up: scan every finalized block since the persisted
+       cursor (or the configured backfill start) so deposits made while the
+       validator was down — or before this code existed — are credited before
+       the first commit window opens.
+    3. Start the background watcher (payments/watch.py).
+    Returns the watcher's stop event, or None when disabled.
+    """
+    set_fee = getattr(reg, "set_grant_fee", None)
+    if set_fee is not None:
+        try:
+            if set_fee(fee_rao):
+                log.info("  payment grant fee in force: %d rao", fee_rao)
+        except Exception as e:
+            log.error("  could not record the payment grant fee: %s", e)
+    try:
+        granted = _sync_payments(reg)
+        balances = _registry_balances(reg)
+        log.info("  payment ledger current: %d new treasury transfer(s) credited at "
+                 "start-up, %d funded coldkey(s), %d credit(s) outstanding",
+                 granted, len(balances), sum(balances.values()))
+    except Exception as e:
+        log.error("  start-up payment catch-up failed (watcher will retry): %s", e)
+    interval = _payment_scan_interval(validator)
+    if interval <= 0:
+        log.warning("  continuous payment scanning DISABLED (interval %.0f)", interval)
+        return None
+    from ..payments.watch import start_payment_watcher
+    stop = start_payment_watcher(reg, interval_s=interval)
+    log.info("  continuous payment watcher started (every %.0fs)", interval)
+    return stop
 
 
 def _start_artifact_publisher(validator):

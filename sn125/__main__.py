@@ -66,6 +66,11 @@ def main():
     p_val.add_argument('--round-fee-tao', type=float, default=None, help='Per-round evaluation fee in TAO. If omitted, calculate from the estimated full-run cost plus 10%% margin.')
     p_val.add_argument('--tao-usd-price', type=float, default=None, help='TAO/USD reference for automatic fee calculation (default: sn125/tao_price.json, currently $250).')
     p_val.add_argument('--finality-depth', type=int, default=10, help='Blocks behind chain head treated as final before crediting a treasury transfer (default: 10).')
+    p_val.add_argument('--payment-ledger', default=None, help='Durable credit-ledger file (credits, debits, processed transfers, scan cursor). Default: SN125_PAYMENT_LEDGER env, else <audit-dir>/payments/ledger.json.')
+    p_val.add_argument('--payment-scan-interval', type=float, default=None, help='Seconds between background treasury scans (default: SN125_PAYMENT_SCAN_S env, else 60). 0 disables the continuous watcher (round-start sync only).')
+    p_val.add_argument('--payment-backfill-hours', type=float, default=72.0, help='On a ledger with no scan cursor, credit treasury deposits from this many hours before start-up (default: 72; 0 = current prune window only). Older blocks are read from the archive endpoint.')
+    p_val.add_argument('--payment-rescan', action='store_true', help='Force the backfill window even when the ledger already has a scan cursor. Safe: processed transfers are never credited twice.')
+    p_val.add_argument('--payment-archive-network', default='archive', help="bittensor network name or wss:// endpoint of an ARCHIVE node used for blocks the primary node has pruned (default: 'archive' = wss://archive.chain.opentensor.ai). '' disables archive reads (old deposits are then lost).")
     p_vf = sub.add_parser('validate-file', help='Check optimizer file passes sandbox')
     p_vf.add_argument('file', help='Path to optimizer .py file')
     p_bp = sub.add_parser('box-probe', help='Standardized GPU throughput probe (the per-box speed gate; prints one parseable result line)')
@@ -146,6 +151,16 @@ def main():
         treasury_coldkey = args.treasury_coldkey or config.TREASURY_COLDKEY
         if not treasury_coldkey:
             parser.error('validate requires --treasury-coldkey')
+        import math
+        for label, value in (('--round-fee-tao', args.round_fee_tao), ('--tao-usd-price', args.tao_usd_price), ('--timeout', args.timeout)):
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                parser.error(f"{label} must be finite and positive")
+        if args.finality_depth < 1:
+            parser.error('--finality-depth must be positive')
+        if args.payment_backfill_hours < 0 or not math.isfinite(args.payment_backfill_hours):
+            parser.error('--payment-backfill-hours must be >= 0')
+        if args.payment_scan_interval is not None and (not math.isfinite(args.payment_scan_interval) or args.payment_scan_interval < 0):
+            parser.error('--payment-scan-interval must be >= 0')
         from . import settings
         from .cloud import ensure_scoring_providers
         from .neuron import CommitHash, GetSubmission, Validator
@@ -186,9 +201,32 @@ def main():
                   f"(estimated ${estimated_cost:.2f} run × 1.10 ÷ ${price:.2f}/TAO)")
         if args.round_fee_tao <= 0:
             parser.error('validate requires --round-fee-tao > 0')
-        subtensor = validator.subtensor or bt.Subtensor(network=args.network)
-        view = BittensorChainView.from_subtensor(subtensor, treasury_coldkey, finality_depth=args.finality_depth)
-        validator.payment_registry = PaymentRegistry(view)
+        from .payments.chain import blocks_for_hours
+        from .payments.store import resolve_ledger_path
+        owner_subtensor = validator.subtensor or bt.Subtensor(network=args.network)
+        subtensor = bt.Subtensor(network=args.network)
+        archive_factory = None
+        archive_network = (args.payment_archive_network or '').strip()
+        if archive_network:
+
+            def archive_factory():
+                return bt.Subtensor(network=archive_network)
+        head = int(subtensor.get_current_block())
+        start_block = None
+        if args.payment_backfill_hours > 0:
+            start_block = max(0, head - args.finality_depth - blocks_for_hours(args.payment_backfill_hours))
+        view = BittensorChainView.from_subtensor(subtensor, treasury_coldkey, finality_depth=args.finality_depth, archive_subtensor_factory=archive_factory, start_block=start_block, owner_subtensor=owner_subtensor)
+        ledger_path = resolve_ledger_path(args.payment_ledger, audit_dir=validator.audit_dir, rounds_dir=validator.rounds_dir)
+        registry = PaymentRegistry(view, store_path=ledger_path)
+        if args.payment_rescan and start_block is not None:
+            registry.rewind_scan(start_block)
+        print(f"[validate] payment ledger → {ledger_path} "
+              f"({len(registry.events)} event(s), {len(registry.balances())} funded coldkey(s)); "
+              f"scan resumes after block {view.scan_cursor()} of finalized "
+              f"{head - args.finality_depth}" + (f"; archive endpoint {archive_network}" if archive_network else '; NO archive endpoint (pruned blocks are skipped)'))
+        validator.payment_registry = registry
+        if args.payment_scan_interval is not None:
+            validator.payment_scan_s = args.payment_scan_interval
         validator.treasury_coldkey = treasury_coldkey
         validator.round_fee_rao = int(round(args.round_fee_tao * RAO_PER_TAO))
         validator.cloud_resource = args.resource
