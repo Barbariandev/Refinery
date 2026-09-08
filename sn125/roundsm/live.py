@@ -872,6 +872,9 @@ def _start_artifact_publisher(validator):
     """Start the continuous artifact publisher (rounds/audit/cloud status ->
     R2 + private HF). Best-effort by design: publishing must never affect the
     round loop, so construction/start failures degrade to a warning."""
+    if str(getattr(validator, "network", "") or "").lower() == "mock":
+        log.info("continuous artifact publisher disabled for the mock network")
+        return None
     try:
         from ..publisher import ContinuousPublisher
         publisher = ContinuousPublisher.from_validator(validator)

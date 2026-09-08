@@ -14,7 +14,7 @@ from typing import ClassVar, Optional
 
 import bittensor as bt
 
-SN125_VERSION = "0.1.0"
+SN125_VERSION = "0.2.0"
 
 from . import settings
 from .references import ADAMW_SOURCE, extract_hparams

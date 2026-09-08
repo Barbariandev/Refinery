@@ -1,10 +1,28 @@
 """Continuous artifact publishing (launch item: no manual copy steps).
 
 Continuously mirrors validator-local artifacts — round JSONs, JSONL audit logs,
-cloud status, spend ledgers, and anything else configured — to two durable
-sinks: a Cloudflare R2 bucket and a private Hugging Face dataset repo. The
-dashboard can consume the R2 snapshot with dashboard/r2_source.py or private
-HF repositories with dashboard/live_sources.py.
+the rotating process log, the durable payment ledger, the inter-round state
+checkpoint, cloud status, and anything else configured — to two durable sinks:
+a Cloudflare R2 bucket and a private Hugging Face dataset repo. On every cycle
+it also rebuilds two derived feeds: the public dashboard contract
+(dashboard/snapshot.py) and the private miner-operations view (ops.py:
+credits per coldkey, deferred queue, live-round progress, recent outcomes,
+logbook index). The dashboard consumes the R2 snapshot with
+dashboard/r2_source.py or private HF repositories with
+dashboard/live_sources.py.
+
+Key layout under the prefix (default ``artifacts/``):
+
+    rounds/<round>.json           full round records
+    audit/<round>.jsonl|.log      per-round audit trail
+    audit/all_rounds.jsonl|.log   the complete logbook across rounds
+    audit/validator.log[.N]       rotating process log (what journalctl shows)
+    audit/autoupdate.log[.N]      supervisor log when running --auto-update
+    payments/ledger.json          durable credit ledger (source of truth for money)
+    state/validator_state.json    deferred queue, round counter, last weights
+    ops/{ops,credits,evaluations,logbook}.json   miner-operations feed
+    dashboard/{snapshot,dashboard,cloud-status}.json
+    cloud/cloud_status.json, publisher/publisher_state.json
 
 Design constraints:
 
@@ -46,6 +64,7 @@ log = logging.getLogger("sn125.publisher")
 DEFAULT_INTERVAL_S = 60.0
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_DIR_PATTERNS = ("*.json", "*.jsonl", "*.log", "*.md")
+AUDIT_PATTERNS = ("*.jsonl", "*.log", "*.log.[0-9]*")
 
 _CONTENT_TYPES = {
     ".json": "application/json",
@@ -53,6 +72,12 @@ _CONTENT_TYPES = {
     ".log": "text/plain",
     ".md": "text/markdown",
 }
+
+
+def _content_type(path: Path) -> str:
+    if ".log." in path.name:
+        return "text/plain"
+    return _CONTENT_TYPES.get(path.suffix, "application/octet-stream")
 
 
 def _bool_env(value: str | None) -> bool | None:
@@ -125,7 +150,7 @@ class R2Sink:
                     Bucket=self.bucket,
                     Key=f"{self.prefix}{key}",
                     Body=body,
-                    ContentType=_CONTENT_TYPES.get(path.suffix, "application/octet-stream"),
+                    ContentType=_content_type(path),
                     CacheControl="no-cache",
                 )
             except Exception as exc:
@@ -345,9 +370,10 @@ class ContinuousPublisher:
                        ) -> "ContinuousPublisher | None":
         """Build the production publisher for a validator, or None when disabled.
 
-        Watches: rounds dir, audit dir, cloud_status.json, and any
-        SN125_PUBLISH_EXTRA_PATHS. Enabled iff a sink is configured (or forced
-        via SN125_PUBLISH_ENABLED).
+        Watches: rounds dir, audit dir (incl. process logs), cloud_status.json,
+        the payment ledger, the loop-state checkpoint, the derived dashboard
+        and ops feeds, and any SN125_PUBLISH_EXTRA_PATHS. Enabled iff a sink
+        is configured (or forced via SN125_PUBLISH_ENABLED).
         """
         env = dict(env if env is not None else os.environ)
         forced = _bool_env(env.get("SN125_PUBLISH_ENABLED"))
@@ -376,10 +402,17 @@ class ContinuousPublisher:
         pkg_dir = Path(__file__).resolve().parent
         rounds_dir = Path(getattr(validator, "rounds_dir", "") or (pkg_dir / "rounds"))
         audit_dir = Path(getattr(validator, "audit_dir", "") or (rounds_dir.parent / "audit"))
+        registry = getattr(validator, "payment_registry", None)
+        ledger_path = Path(getattr(registry, "store_path", None)
+                           or audit_dir / "payments" / "ledger.json")
+        state_path = Path(getattr(validator, "state_path", None)
+                          or audit_dir / "validator_state.json")
         roots = [
             WatchRoot("rounds", rounds_dir, ("*.json",)),
-            WatchRoot("audit", audit_dir, ("*.jsonl", "*.log")),
+            WatchRoot("audit", audit_dir, AUDIT_PATTERNS),
             WatchRoot("cloud", pkg_dir / "cloud_status.json"),
+            WatchRoot("payments", ledger_path),
+            WatchRoot("state", state_path),
         ]
         for i, raw in enumerate(x.strip() for x in
                                 env.get("SN125_PUBLISH_EXTRA_PATHS", "").split(",")):
@@ -397,16 +430,37 @@ class ContinuousPublisher:
 
         from .dashboard.snapshot import build_snapshot, write_snapshot
         from .neuron import SN125_VERSION
+        from .ops import OPS_DIRNAME, build_ops_snapshot, write_ops_snapshot
         snapshot_dir = audit_dir / "dashboard"
+        ops_dir = audit_dir / OPS_DIRNAME
         cloud_path = pkg_dir / "cloud_status.json"
         wallet = getattr(validator, "wallet", None)
         hotkey = wallet.hotkey.ss58_address if wallet is not None else "unconfigured"
+        ops_extra = {
+            "netuid": getattr(validator, "netuid", None),
+            "network": getattr(validator, "network", ""),
+            "started_at": int(time.time()),
+        }
 
         def prepare():
-            write_snapshot(snapshot_dir, build_snapshot(
-                rounds_dir, cloud_path, validator_hotkey=hotkey, version=SN125_VERSION))
+            errors = []
+            try:
+                write_snapshot(snapshot_dir, build_snapshot(
+                    rounds_dir, cloud_path, validator_hotkey=hotkey, version=SN125_VERSION))
+            except Exception as exc:
+                errors.append(exc)
+            try:
+                write_ops_snapshot(ops_dir, build_ops_snapshot(
+                    rounds_dir=rounds_dir, audit_dir=audit_dir, ledger_path=ledger_path,
+                    state_path=state_path, validator_hotkey=hotkey,
+                    version=SN125_VERSION, extra=ops_extra))
+            except Exception as exc:
+                errors.append(exc)
+            if errors:
+                raise errors[0]
 
         roots.append(WatchRoot("dashboard", snapshot_dir, ("*.json",)))
+        roots.append(WatchRoot(OPS_DIRNAME, ops_dir, ("*.json",)))
         publisher = cls(roots, sinks, interval_s=interval_s, max_bytes=max_bytes,
                         state_path=audit_dir / "publisher_state.json", prepare=prepare)
         publisher.roots.append(WatchRoot("publisher", publisher.state_path))

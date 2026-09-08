@@ -107,6 +107,24 @@ def strip_supervisor_flags(argv: Sequence[str]) -> list[str]:
     return out
 
 
+def audit_dir_from_argv(argv: Sequence[str], root: str | Path | None = None) -> Path:
+    """The child validator's audit directory: ``--audit-dir`` from its argv,
+    else ``SN125_AUDIT_DIR``, else ``<root>/sn125/audit`` (the live loop's
+    default). Used only to place the supervisor's own log file."""
+    args = list(argv)
+    for i, a in enumerate(args):
+        if a == "--audit-dir" and i + 1 < len(args) and args[i + 1]:
+            return Path(args[i + 1]).expanduser()
+        if a.startswith("--audit-dir="):
+            value = a.split("=", 1)[1]
+            if value:
+                return Path(value).expanduser()
+    env_dir = (os.environ.get("SN125_AUDIT_DIR") or "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser()
+    return Path(root or repo_root()) / "sn125" / "audit"
+
+
 
 class Repo:
     """Thin git wrapper over one working tree."""
@@ -509,6 +527,11 @@ def supervise(full_argv: Sequence[str], *, interval_s: float | None = None) -> i
     child_argv = strip_supervisor_flags(full_argv)
     root = repo_root()
     program = [sys.executable, "-m", "sn125", *full_argv]
+    try:
+        from .logfile import attach_rotating_log
+        attach_rotating_log(audit_dir_from_argv(child_argv, root) / "autoupdate.log")
+    except Exception as exc:
+        log.warning("supervisor file log unavailable: %s", exc)
 
     def self_exec() -> None:
         os.chdir(str(root))

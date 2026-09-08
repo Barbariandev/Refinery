@@ -189,6 +189,9 @@ def main():
               f"(B200-only; round pauses when every provider is dry)")
         wallet = bt.Wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
         validator = Validator(wallet=wallet, netuid=args.netuid, network=args.network, set_weights=args.set_weights, tasks=tasks, num_trials=1, submission_timeout=args.timeout, mode='prod', backend=','.join(providers), cloud_resource=args.resource, audit_dir=args.audit_dir, burn_fraction_floor=args.burn_fraction_floor)
+        from .logfile import attach_rotating_log
+        from .roundsm.live import _audit_dir_for
+        attach_rotating_log(_audit_dir_for(validator) / 'validator.log')
         if args.round_fee_tao is None:
             from .cloud import SKU_COSTS, SUBMISSION_MARGIN
             from .pricing import fee_tao_for_cost, tao_usd_price
