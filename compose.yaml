@@ -1,0 +1,63 @@
+services:
+  validator:
+    image: ${REFINERY_IMAGE:?Set REFINERY_IMAGE to your published release image}
+    build: .
+    init: true
+    restart: "no"
+    stop_grace_period: 2m
+    env_file: validator.env
+    environment:
+      SN125_CLOUD_PROVIDERS: runpod
+      SN125_FINEWEB_DIR: /data/fineweb_edu_smollm2_seq2048
+    command:
+      - validate
+      - --wallet-name
+      - ${VALIDATOR_WALLET_NAME:-refinery-validator}
+      - --wallet-hotkey
+      - ${VALIDATOR_HOTKEY_NAME:?Set the local validator hotkey name}
+      - --provider
+      - runpod
+      - --audit-dir
+      - /app/sn125/audit
+    volumes:
+      - type: bind
+        source: ${VALIDATOR_WALLETS_DIR:?Set the absolute wallet directory}
+        target: /root/.bittensor/wallets
+        read_only: true
+        bind:
+          create_host_path: false
+      - data:/data
+      - hf-cache:/root/.cache/huggingface
+      - cloud-state:/root/.sn125
+      - rounds:/app/sn125/rounds
+      - audit:/app/sn125/audit
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.monitor-only: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  watchtower:
+    profiles: [updates]
+    image: ${WATCHTOWER_IMAGE:-containrrr/watchtower:1.7.1}
+    restart: unless-stopped
+    command: [--label-enable, --monitor-only, --interval, "300"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  data:
+  hf-cache:
+  cloud-state:
+  rounds:
+  audit:

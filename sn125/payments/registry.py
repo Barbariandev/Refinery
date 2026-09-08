@@ -3,9 +3,14 @@
 Rules implemented (each maps to a §8 / E4 clause):
 
 - Credits are granted on **observed finalized transfers** to the treasury
-  coldkey: ``floor(amount / round_fee)`` credits to the *sender coldkey*.
-  Per-transfer floor — two half-fee payments do NOT sum to a credit (the
-  remainder is recorded in the ledger for auditability, never credited).
+  coldkey: ``floor((carry + amount) / fee)`` credits to the *sender coldkey*,
+  where ``carry`` is that coldkey's unspent rao remainder from earlier
+  transfers. The remainder below one fee is **carried forward** (per
+  coldkey, in rao) and recorded on the grant event, so an under- or
+  over-payment is never silently kept by the treasury: two half-fee
+  transfers buy one credit, 1.00 TAO against a 0.73 fee buys one credit and
+  keeps 0.27 TAO toward the next. Carry is rao, so it is applied at whatever
+  fee is in force when the next transfer lands.
 - Credits are spendable by **any hotkey under that coldkey** (Sybil-neutral:
   still one fee per submission). Hotkey→coldkey resolution comes from the
   chain's metagraph association, never from miner claims.
@@ -149,6 +154,7 @@ class LedgerEvent:
     tx_id: str | None
     hotkey: str | None
     note: str
+    carry_rao: int = 0
 
 
 class PaymentRegistry:
@@ -165,6 +171,7 @@ class PaymentRegistry:
         self._store_path = Path(store_path) if store_path else None
         self._events: list[LedgerEvent] = []
         self._balances: dict[str, int] = {}
+        self._carry: dict[str, int] = {}
         self._seen_tx: set[str] = set()
         self._last_block = -1
         self._fee_rao: int | None = None
@@ -296,17 +303,27 @@ class PaymentRegistry:
             if t.tx_id in self._seen_tx:
                 continue
             self._seen_tx.add(t.tx_id)
-            credits = t.amount_rao // fee
-            remainder = t.amount_rao - credits * fee
+            carried_in = self._carry.get(t.src_coldkey, 0)
+            pool = carried_in + t.amount_rao
+            credits = pool // fee
+            carry = pool - credits * fee
             if credits:
                 self._balances[t.src_coldkey] = (
                     self._balances.get(t.src_coldkey, 0) + credits)
+            if carry:
+                self._carry[t.src_coldkey] = carry
+            else:
+                self._carry.pop(t.src_coldkey, None)
+            src = (f"{t.amount_rao} rao + {carried_in} rao carried in"
+                   if carried_in else f"{t.amount_rao} rao")
             self._append(
                 "grant", coldkey=t.src_coldkey, credits=credits,
-                rao=t.amount_rao, tx_id=t.tx_id,
-                note=(f"{credits} credit(s), remainder {remainder} rao"
+                rao=t.amount_rao, tx_id=t.tx_id, carry_rao=carry,
+                note=(f"{src} at fee {fee} rao: {credits} credit(s), "
+                      f"{carry} rao carried forward"
                       if credits else
-                      f"below fee ({t.amount_rao} < {fee} rao): 0 credits"),
+                      f"{src} below fee {fee} rao: 0 credits, "
+                      f"{carry} rao carried forward"),
             )
             n += 1
         return n
@@ -319,6 +336,16 @@ class PaymentRegistry:
         """Snapshot of every non-zero balance."""
         with self._lock:
             return {k: v for k, v in self._balances.items() if v}
+
+    def carry_rao(self, coldkey: str) -> int:
+        """Unspent rao this coldkey has paid toward its next credit."""
+        with self._lock:
+            return self._carry.get(coldkey, 0)
+
+    def carries(self) -> dict[str, int]:
+        """Snapshot of every non-zero carried remainder (rao)."""
+        with self._lock:
+            return {k: v for k, v in self._carry.items() if v}
 
     def coldkey_for_hotkey(self, hotkey: str) -> str:
         coldkey = self._chain.hotkey_owner(hotkey)
@@ -370,28 +397,38 @@ class PaymentRegistry:
                 balances[e.coldkey] = balances.get(e.coldkey, 0) + e.credits
         return {k: v for k, v in balances.items() if v or k in balances}
 
+    @staticmethod
+    def replay_carry(events: list[LedgerEvent]) -> dict[str, int]:
+        """Reconstruct every carried remainder from the event log alone."""
+        carry: dict[str, int] = {}
+        for e in events:
+            if e.kind == "grant" and e.coldkey is not None:
+                carry[e.coldkey] = e.carry_rao
+        return {k: v for k, v in carry.items() if v}
+
     def _append(self, kind: str, *, round_id: str | None = None,
                 coldkey: str | None = None, credits: int = 0, rao: int = 0,
                 tx_id: str | None = None, hotkey: str | None = None,
-                note: str = "") -> None:
+                note: str = "", carry_rao: int = 0) -> None:
         self._events.append(LedgerEvent(
             seq=len(self._events), kind=kind, round_id=round_id,
             coldkey=coldkey, credits=credits, rao=rao, tx_id=tx_id,
-            hotkey=hotkey, note=note))
+            hotkey=hotkey, note=note, carry_rao=carry_rao))
 
     def _transaction(self, fn):
         """Apply ``fn`` then persist; roll memory back if either fails.
 
         Must be called with ``self._lock`` held.
         """
-        saved = (list(self._events), dict(self._balances), set(self._seen_tx),
-                 self._last_block, self._fee_rao, dict(self._pinned_rounds))
+        saved = (list(self._events), dict(self._balances), dict(self._carry),
+                 set(self._seen_tx), self._last_block, self._fee_rao,
+                 dict(self._pinned_rounds))
         try:
             result = fn()
             self._persist()
             return result
         except Exception:
-            (self._events, self._balances, self._seen_tx,
+            (self._events, self._balances, self._carry, self._seen_tx,
              self._last_block, self._fee_rao, self._pinned_rounds) = saved
             raise
 
@@ -434,6 +471,7 @@ class PaymentRegistry:
             "scan_cursor": self._chain_cursor(),
             "pinned_rounds": dict(self._pinned_rounds),
             "balances": {k: v for k, v in self._balances.items() if v},
+            "carry_rao": {k: v for k, v in self._carry.items() if v},
             "seen_tx": sorted(self._seen_tx),
             "events": [asdict(e) for e in self._events],
         }
@@ -457,7 +495,8 @@ class PaymentRegistry:
                     round_id=raw.get("round_id"), coldkey=raw.get("coldkey"),
                     credits=int(raw.get("credits") or 0), rao=int(raw.get("rao") or 0),
                     tx_id=raw.get("tx_id"), hotkey=raw.get("hotkey"),
-                    note=str(raw.get("note") or ""))
+                    note=str(raw.get("note") or ""),
+                    carry_rao=int(raw.get("carry_rao") or 0))
             except (KeyError, TypeError, ValueError, AttributeError) as e:
                 raise LedgerStoreError(
                     f"payment ledger {self._store_path}: malformed event #{i}: {e}") from e
@@ -474,6 +513,19 @@ class PaymentRegistry:
             raise LedgerStoreError(
                 f"payment ledger {self._store_path}: stored balances do not match "
                 f"the replayed event log (stored={stored}, replayed={replayed})")
+        replayed_carry = self.replay_carry(events)
+        if "carry_rao" in data:
+            try:
+                stored_carry = {str(k): int(v) for k, v in (data["carry_rao"] or {}).items()
+                                if int(v)}
+            except (TypeError, ValueError) as e:
+                raise LedgerStoreError(
+                    f"payment ledger {self._store_path}: bad carry_rao: {e}") from e
+            if stored_carry != replayed_carry:
+                raise LedgerStoreError(
+                    f"payment ledger {self._store_path}: stored carried remainders do "
+                    f"not match the replayed event log (stored={stored_carry}, "
+                    f"replayed={replayed_carry})")
         seen = {str(tx) for tx in (data.get("seen_tx") or [])}
         seen.update(e.tx_id for e in events if e.kind == "grant" and e.tx_id)
         pinned = {str(k): int(v) for k, v in (data.get("pinned_rounds") or {}).items()}
@@ -486,6 +538,7 @@ class PaymentRegistry:
             fee = pins[-1] if pins else None
         self._events = events
         self._balances = replayed
+        self._carry = replayed_carry
         self._seen_tx = seen
         self._pinned_rounds = pinned
         self._fee_rao = int(fee) if fee is not None else None

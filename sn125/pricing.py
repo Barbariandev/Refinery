@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 
 DEFAULT_TAO_USD = 250.0
@@ -45,4 +46,6 @@ def fee_tao_for_cost(cost_usd: float, *, price_usd: float | None = None,
         raise ValueError("TAO/USD price must be positive")
     if not math.isfinite(margin) or margin < 0:
         raise ValueError("fee margin must be non-negative")
-    return math.ceil((cost * (1.0 + margin) / price) * 1000.0) / 1000.0
+    amount = (Decimal(str(cost_usd)) * (Decimal(1) + Decimal(str(margin)))
+              / Decimal(str(price)))
+    return float(amount.quantize(Decimal('0.001'), rounding=ROUND_CEILING))

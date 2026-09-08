@@ -70,6 +70,8 @@ def main():
     p_val.add_argument('--payment-scan-interval', type=float, default=None, help='Seconds between background treasury scans (default: SN125_PAYMENT_SCAN_S env, else 60). 0 disables the continuous watcher (round-start sync only).')
     p_val.add_argument('--payment-backfill-hours', type=float, default=72.0, help='On a ledger with no scan cursor, credit treasury deposits from this many hours before start-up (default: 72; 0 = current prune window only). Older blocks are read from the archive endpoint.')
     p_val.add_argument('--payment-rescan', action='store_true', help='Force the backfill window even when the ledger already has a scan cursor. Safe: processed transfers are never credited twice.')
+    p_val.add_argument('--auto-update', action='store_true', help='Run under the auto-update supervisor (sn125/autoupdate.py): keep this git checkout current with its upstream and restart the validator only at round boundaries, resuming from the durable ledger and state checkpoint. All other flags are passed through unchanged. Requires running from a git clone.')
+    p_val.add_argument('--update-interval', type=float, default=None, help='Seconds between upstream checks with --auto-update (default: SN125_UPDATE_INTERVAL_S env, else 300).')
     p_val.add_argument('--payment-archive-network', default='archive', help="bittensor network name or wss:// endpoint of an ARCHIVE node used for blocks the primary node has pruned (default: 'archive' = wss://archive.chain.opentensor.ai). '' disables archive reads (old deposits are then lost).")
     p_vf = sub.add_parser('validate-file', help='Check optimizer file passes sandbox')
     p_vf.add_argument('file', help='Path to optimizer .py file')
@@ -147,6 +149,9 @@ def main():
         Miner(wallet, port=args.port, optimizer_path=args.optimizer).run()
     elif args.command == 'validate':
         _check_no_duplicate('validate')
+        if args.auto_update:
+            from .autoupdate import supervise
+            sys.exit(supervise(sys.argv[1:], interval_s=args.update_interval))
         from . import config
         treasury_coldkey = args.treasury_coldkey or config.TREASURY_COLDKEY
         if not treasury_coldkey:
@@ -232,7 +237,9 @@ def main():
         validator.cloud_resource = args.resource
         validator.commit_synapse_cls = CommitHash
         validator.submission_synapse_cls = GetSubmission
-        run_fsm_validator(validator)
+        if run_fsm_validator(validator) == 'restart':
+            from .roundsm.live import EXIT_RESTART
+            sys.exit(EXIT_RESTART)
     elif args.command == 'calibrate':
         import json as _json
         from .cloud import CLOUD_PROVIDERS

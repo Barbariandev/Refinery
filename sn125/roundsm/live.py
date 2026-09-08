@@ -15,7 +15,18 @@ lower layers were built for:
       build ScoreRecords for the SCORED submissions
       compute_weights    ->  save round  ->  set weights (if enabled)  ->  publish attestation
       carry DEFERRED commits forward to next round
+      checkpoint the inter-round state (roundsm/state.py)
+      honour a pending restart request (auto-update) at this safe point
       sleep to the 24h boundary
+
+Restart safety: the round boundary — after the round is saved, published and
+its state checkpointed, before the next round pins a fee — is the ONLY point
+where stopping the process loses nothing. ``run_fsm_validator`` therefore
+checks for a restart request there (a flag file named by ``SN125_RESTART_FLAG``
+/ ``validator.restart_flag_path``, written by sn125/autoupdate.py) and returns
+``"restart"`` instead of starting the next round; the next process resumes
+from the checkpoint (round counter, deferred carryover, fairness window, last
+weights) and the durable payment ledger.
 
 Everything impure arrives through the ``validator`` object (its dendrite, cloud
 orchestrator, metagraph sync, weight/attestation helpers, and the configured
@@ -55,8 +66,13 @@ from .adapter import (
 from .audit import JsonlAuditLog, audit_emit, looks_like_crash, payload_record
 from .driver import DEFAULT_OUTAGE_BACKOFF_S, EvalResult, drive_round
 from .round_fsm import MAX_EVAL_PER_ROUND, RoundConfig, RoundFSM, SubStatus
+from .state import default_state_path, load_loop_state, save_loop_state
 
 log = logging.getLogger("sn125.fsm")
+
+RESTART_FLAG_ENV = "SN125_RESTART_FLAG"
+EXIT_RESTART = 75
+_BOUNDARY_POLL_S = 60.0
 
 DEFAULT_COMMIT_WINDOW_S = 3 * 3600.0
 DEFAULT_REVEAL_WINDOW_S = 1 * 3600.0
@@ -467,12 +483,29 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
     carryover: list = []
     recent_rounds: list[set[str]] = []
     round_num = 0
+    state_path = _state_path_for(validator)
+    restored = load_loop_state(state_path) if state_path is not None else None
+    if restored is not None:
+        round_num = restored["round_num"]
+        carryover = restored["carryover"]
+        recent_rounds = restored["recent_rounds"][-fairness_window:] if fairness_window > 0 else []
+        if restored["last_weights"] and not (getattr(validator, "_last_weights", None) or {}):
+            try:
+                validator._last_weights = dict(restored["last_weights"])
+            except Exception:
+                pass
+        log.info("resumed validator state from %s: next round #%d, %d deferred "
+                 "submission(s) carried over, %d weight(s) for the epoch refresh "
+                 "(last round %s)", state_path, round_num, len(carryover),
+                 len(restored["last_weights"]), restored.get("last_round_id"))
+    restart_reason: str | None = None
     weight_refresh_stop = None
     if getattr(validator, "set_weights_enabled", False):
         weight_refresh_stop = _start_weight_refresh(validator)
     publisher = _start_artifact_publisher(validator)
     payment_watch_stop = _start_payment_watcher(validator, reg, fee_rao)
-    while max_rounds is None or round_num < max_rounds:
+    rounds_this_process = 0
+    while max_rounds is None or rounds_this_process < max_rounds:
         round_start = clock()
         round_id = f"round_{round_num:06d}_{int(round_start)}_{vhk}"
         audit = _make_round_audit(validator, round_id)
@@ -699,11 +732,32 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
             if publisher is not None:
                 publisher.publish_now()
             round_num += 1
-            elapsed = clock() - round_start
-            remaining = round_period_s - elapsed
-            if remaining > 0:
-                log.info("  next round in %.0fs", remaining)
-                sleep(remaining)
+            rounds_this_process += 1
+            if state_path is not None:
+                try:
+                    save_loop_state(state_path, round_num=round_num, carryover=carryover,
+                                    recent_rounds=recent_rounds,
+                                    last_weights=getattr(validator, "_last_weights", None),
+                                    last_round_id=round_id)
+                except Exception as e:
+                    log.error("  could not checkpoint validator state to %s: %s",
+                              state_path, e)
+            if _restart_requested(validator):
+                restart_reason = "restart"
+            else:
+                remaining = round_period_s - (clock() - round_start)
+                if remaining > 0:
+                    log.info("  next round in %.0fs", remaining)
+                while remaining > 0:
+                    sleep(min(remaining, _BOUNDARY_POLL_S))
+                    if _restart_requested(validator):
+                        restart_reason = "restart"
+                        break
+                    remaining = round_period_s - (clock() - round_start)
+        if restart_reason is not None:
+            log.info("  restart requested; stopping at the round boundary after "
+                     "round #%d (state checkpointed to %s)", round_num - 1, state_path)
+            break
     if weight_refresh_stop is not None:
         weight_refresh_stop.set()
     if payment_watch_stop is not None:
@@ -713,6 +767,42 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
             publisher.stop(flush=True)
         except Exception as e:
             log.warning("artifact publisher shutdown failed: %s", e)
+    if restart_reason is not None:
+        try:
+            validator.restart_requested = True
+        except Exception:
+            pass
+    return restart_reason
+
+
+def _state_path_for(validator) -> Path | None:
+    """``validator.state_path`` (``""``/None disables) else
+    ``<audit_dir>/validator_state.json``."""
+    if hasattr(validator, "state_path"):
+        configured = getattr(validator, "state_path")
+        return Path(configured) if configured else None
+    try:
+        return default_state_path(_audit_dir_for(validator))
+    except Exception as e:
+        log.warning("no validator state path (%s); inter-round state is memory-only", e)
+        return None
+
+
+def _restart_flag_path(validator) -> Path | None:
+    configured = (getattr(validator, "restart_flag_path", None)
+                  or os.environ.get(RESTART_FLAG_ENV, ""))
+    return Path(configured) if configured else None
+
+
+def _restart_requested(validator) -> bool:
+    """True when the supervisor has asked for a restart at the next safe point."""
+    if bool(getattr(validator, "restart_requested", False)):
+        return True
+    flag = _restart_flag_path(validator)
+    try:
+        return flag is not None and flag.exists()
+    except OSError:
+        return False
 
 
 def _sync_payments(reg) -> int:

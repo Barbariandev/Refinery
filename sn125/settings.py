@@ -70,7 +70,7 @@ HF_HOME_ENV = "HF_HOME"
 _OFF_VALUES = frozenset({"", "0", "false", "no", "off"})
 _DEFAULT_HF_HOME = "~/.cache/huggingface"
 
-DEFAULT_CLOUD_PROVIDER_CHAIN = ("runpod", "lambda")
+DEFAULT_CLOUD_PROVIDER_CHAIN = ("runpod",)
 DEFAULT_BOX_PROBE_BAND_PCT = 5.0
 
 
