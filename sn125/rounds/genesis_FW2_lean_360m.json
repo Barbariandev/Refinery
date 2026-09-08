@@ -1,0 +1,375 @@
+{
+  "baselines": {
+    "FW2_smol_360M": {
+      "checkpoints": [],
+      "error": "",
+      "eval_points": [
+        [
+          0,
+          11.3,
+          0.0
+        ],
+        [
+          188000,
+          3.2,
+          72000.0
+        ]
+      ],
+      "failed": false,
+      "state_multiplier": 0.0,
+      "train_points": [
+        [
+          0,
+          11.3
+        ],
+        [
+          188000,
+          3.2
+        ]
+      ],
+      "wall_seconds": 72000.0
+    }
+  },
+  "code_hashes": {
+    "adamw_genesis": "51b1229063d62b552511865d2c23209c54b4f7d51396aa0d637c5f8b49274046"
+  },
+  "genesis": true,
+  "genesis_metadata": {
+    "checkpoint_out": "/workspace/sn125/rounds/genesis_adamw.safetensors",
+    "completed_at": 1783260430.4335322,
+    "data_dir": "/workspace/data/fineweb_edu_smollm2_seq2048",
+    "data_manifest": "bfef73a8aada7237f1d54c6e96eb90f8da5d2f609dfc7ae51c45dbe2487ac88c",
+    "prod_eval_result": "/workspace/sn125/rounds/genesis_prod_eval_result.json",
+    "quartile_checkpoints": [
+      "/workspace/sn125/rounds/genesis_adamw_q25.safetensors",
+      "/workspace/sn125/rounds/genesis_adamw_q50.safetensors",
+      "/workspace/sn125/rounds/genesis_adamw_q75.safetensors"
+    ],
+    "source": "scripts/run_genesis_baseline.py"
+  },
+  "round_id": "genesis_FW2_lean_360M",
+  "sources": {
+    "51b1229063d62b552511865d2c23209c54b4f7d51396aa0d637c5f8b49274046": "\nHPARAMS = {\"lr\": 1e-3, \"weight_decay\": 0.01}\n# NOTE trusted_weight_decay is deliberately OFF: the harness applies trusted wd\n# at a CONSTANT rate (update_scale is pinned to 1.0 \u2014 the submission owns its\n# schedule), so a scheduled optimizer that delegated wd would keep shrinking\n# its weights through the post-decay LR~=0 tail (~0.8x over a 20h surplus).\n# Decoupled wd must therefore be applied here, scaled by the same WSD factor.\nCAPABILITIES = {\"requires_param_values\": True, \"trusted_weight_decay\": False,\n                \"returns_full_update\": True, \"ordered_buffers\": True}\nimport torch, math\nclass Optimizer:\n    \"\"\"Foreach AdamW with an internal WSD (warmup-stable-decay) schedule.\n\n    Update math matches the genesis constant-LR AdamW (same foreach kernel\n    sequence, fp32 state); the only addition is the schedule scale on lr \u2014\n    linear warmup over config warmup_steps, cosine decay to 0 over the last\n    decay_fraction of config total_steps (identical to the harness's\n    documented wsd_schedule_scale).\"\"\"\n    def __init__(self, param_groups, config):\n        self.param_groups = param_groups\n        self.config = config\n        dev = config.get(\"_device\", \"cuda\")\n        self.total_steps = int(config.get(\"total_steps\", 0) or 0)\n        self.warmup_steps = int(config.get(\"warmup_steps\", 0) or 0)\n        self.decay_fraction = float(config.get(\"decay_fraction\", 0.0) or 0.0)\n        self.state = {}\n        self.names = []\n        self.m_list = []\n        self.v_list = []\n        self.group_ranges = []\n        idx = 0\n        for pg in param_groups:\n            start = idx\n            for name, shape, dtype in pg[\"params\"]:\n                m = torch.zeros(shape, dtype=dtype, device=dev)\n                v = torch.zeros(shape, dtype=dtype, device=dev)\n                self.state[name] = {\"m\": m, \"v\": v}\n                self.names.append(name)\n                self.m_list.append(m)\n                self.v_list.append(v)\n                idx += 1\n            self.group_ranges.append((start, idx, pg[\"lr\"], pg[\"weight_decay\"]))\n        self.beta1, self.beta2, self.eps = 0.9, 0.999, 1e-8\n\n    def _schedule(self, step):\n        if self.warmup_steps > 0 and step < self.warmup_steps:\n            return (step + 1) / self.warmup_steps\n        if self.decay_fraction > 0.0 and self.total_steps > 0:\n            decay_steps = max(1, int(self.total_steps * self.decay_fraction))\n            decay_start = self.total_steps - decay_steps\n            if step >= decay_start:\n                progress = min(1.0, (step - decay_start) / decay_steps)\n                return 0.5 * (1.0 + math.cos(math.pi * progress))\n        return 1.0\n\n    def step_ordered(self, gradients, param_values, step_number):\n        t = step_number + 1\n        scale = self._schedule(step_number)\n        for start, end, lr, wd in self.group_ranges:\n            if start == end:\n                continue\n            slr = lr * scale\n            m_list = self.m_list[start:end]\n            v_list = self.v_list[start:end]\n            grads = gradients[start:end]\n            torch._foreach_mul_(m_list, self.beta1)\n            torch._foreach_add_(m_list, grads, alpha=1 - self.beta1)\n            torch._foreach_mul_(v_list, self.beta2)\n            torch._foreach_addcmul_(v_list, grads, grads, value=1 - self.beta2)\n            m_hat = torch._foreach_div(m_list, 1 - self.beta1 ** t)\n            v_hat = torch._foreach_div(v_list, 1 - self.beta2 ** t)\n            denom = torch._foreach_sqrt(v_hat)\n            torch._foreach_add_(denom, self.eps)\n            updates = torch._foreach_div(m_hat, denom)\n            torch._foreach_mul_(updates, -slr)\n            if wd > 0 and param_values:\n                torch._foreach_add_(updates, param_values[start:end], alpha=-slr * wd)\n            torch._foreach_copy_(grads, updates)\n        return None\n\n    def step(self, gradients, param_values, step_number):\n        t = step_number + 1\n        scale = self._schedule(step_number)\n        updates = {}\n        for start, end, lr, wd in self.group_ranges:\n            slr = lr * scale\n            for name in self.names[start:end]:\n                g = gradients[name]\n                s = self.state[name]\n                s[\"m\"].mul_(self.beta1).add_(g, alpha=1 - self.beta1)\n                s[\"v\"].mul_(self.beta2).addcmul_(g, g, value=1 - self.beta2)\n                m_hat = s[\"m\"] / (1 - self.beta1 ** t)\n                v_hat = s[\"v\"] / (1 - self.beta2 ** t)\n                u = -slr * (m_hat / (v_hat.sqrt() + self.eps))\n                if wd > 0 and name in param_values:\n                    u = u.add(param_values[name], alpha=-slr * wd)\n                updates[name] = u\n        return updates\n\n    def state_dict(self):\n        return {k: {kk: vv.clone() for kk, vv in v.items()} for k, v in self.state.items()}\n\n    def load_state_dict(self, s):\n        for k, v in s.items():\n            for kk, vv in v.items():\n                self.state[k][kk].copy_(vv)\n"
+  },
+  "submissions": {
+    "adamw_genesis": {
+      "code_hash": "51b1229063d62b552511865d2c23209c54b4f7d51396aa0d637c5f8b49274046",
+      "curves": {
+        "FW2_smol_360M": {
+          "checkpoints": [
+            {
+              "eval_loss": 3.0160101344808936,
+              "path": "/workspace/sn125/rounds/genesis_adamw_q25.safetensors",
+              "pct": 0.25,
+              "sha256": "2f0e2bb90c31bc895d7bcb80a213aca75042c2ea59bbd2d110a394fcf7933109",
+              "step": 49929,
+              "wall_t": 18024.469819307327
+            },
+            {
+              "eval_loss": 2.9193704538047314,
+              "path": "/workspace/sn125/rounds/genesis_adamw_q50.safetensors",
+              "pct": 0.5,
+              "sha256": "6eb403015b494c523dd55fcc2535b6a3563dea580d5dce704ceb923275985637",
+              "step": 99992,
+              "wall_t": 36024.75271654129
+            },
+            {
+              "eval_loss": 2.8802501065656543,
+              "path": "/workspace/sn125/rounds/genesis_adamw_q75.safetensors",
+              "pct": 0.75,
+              "sha256": "210e65e14f79d73641e851a1d11b3ff238a77344d5c83a47f210f0a3f73bfdc6",
+              "step": 150122,
+              "wall_t": 54024.70494890213
+            },
+            {
+              "eval_loss": 2.77631598059088,
+              "path": "/workspace/sn125/rounds/genesis_adamw.safetensors",
+              "pct": 1.0,
+              "sha256": "2d7dae3d634c6666dc35b1063f14a3bbdf68492b1516279143682f799c4de868",
+              "step": 200495,
+              "wall_t": 72024.75275087357
+            }
+          ],
+          "error": "",
+          "eval_points": [
+            [
+              0,
+              10.995837438851595,
+              48.79774594306946
+            ],
+            [
+              9400,
+              3.4545445274561644,
+              3423.170763015747
+            ],
+            [
+              18800,
+              3.2142796833068132,
+              6798.0866522789
+            ],
+            [
+              28200,
+              3.1216334057971835,
+              10181.61445569992
+            ],
+            [
+              37600,
+              3.0683388244360685,
+              13568.765509605408
+            ],
+            [
+              47000,
+              3.025584666058421,
+              16954.44849228859
+            ],
+            [
+              56400,
+              2.995932325720787,
+              20353.1344935894
+            ],
+            [
+              65800,
+              2.973867444321513,
+              23724.87046456337
+            ],
+            [
+              75200,
+              2.95315642375499,
+              27094.854192733765
+            ],
+            [
+              84600,
+              2.939497889019549,
+              30473.745974063873
+            ],
+            [
+              94000,
+              2.926367225125432,
+              33855.87323856354
+            ],
+            [
+              103400,
+              2.915819893591106,
+              37266.34183049202
+            ],
+            [
+              112800,
+              2.906769782304764,
+              40648.66103601456
+            ],
+            [
+              122200,
+              2.897581646218896,
+              44020.61341834068
+            ],
+            [
+              131600,
+              2.892663588747382,
+              47392.22813773155
+            ],
+            [
+              141000,
+              2.8857487784698606,
+              50756.03985762596
+            ],
+            [
+              150400,
+              2.8806977597996593,
+              54146.56587076187
+            ],
+            [
+              159800,
+              2.8526809066534042,
+              57505.9883954525
+            ],
+            [
+              169200,
+              2.8035369468852878,
+              60853.5194811821
+            ],
+            [
+              178600,
+              2.7782174460589886,
+              64206.415405750275
+            ],
+            [
+              188000,
+              2.77631598059088,
+              67558.05638480186
+            ],
+            [
+              197400,
+              2.77631598059088,
+              70905.56489372253
+            ],
+            [
+              200495,
+              2.776390324346721,
+              72022.65808463097
+            ]
+          ],
+          "failed": false,
+          "state_multiplier": 1.011643322534627,
+          "train_points": [
+            [
+              0,
+              10.995837438851595
+            ],
+            [
+              9400,
+              4.377664630477493
+            ],
+            [
+              18800,
+              3.3247547443598915
+            ],
+            [
+              28200,
+              3.1718850103584497
+            ],
+            [
+              37600,
+              3.090435168514513
+            ],
+            [
+              47000,
+              3.0463391091372514
+            ],
+            [
+              56400,
+              3.0089925315282118
+            ],
+            [
+              65800,
+              2.977447841618512
+            ],
+            [
+              75200,
+              2.9670881506514877
+            ],
+            [
+              84600,
+              2.954803417806756
+            ],
+            [
+              94000,
+              2.9394889683336825
+            ],
+            [
+              103400,
+              2.926457999503776
+            ],
+            [
+              112800,
+              2.9145395949080184
+            ],
+            [
+              122200,
+              2.9113014854796946
+            ],
+            [
+              131600,
+              2.9081256002993197
+            ],
+            [
+              141000,
+              2.8964975174159218
+            ],
+            [
+              150400,
+              2.888287599772623
+            ],
+            [
+              159800,
+              2.882620431281425
+            ],
+            [
+              169200,
+              2.8344516917450786
+            ],
+            [
+              178600,
+              2.8044181353337057
+            ],
+            [
+              188000,
+              2.786198233904904
+            ],
+            [
+              197400,
+              2.7784536819200256
+            ],
+            [
+              200495,
+              2.788487603267034
+            ]
+          ],
+          "wall_seconds": 72026.08545255661
+        }
+      },
+      "hparams_per_task": {
+        "FW2_smol_360M": [
+          0.001,
+          0.01
+        ]
+      },
+      "score": {
+        "best_hparams": {
+          "FW2_smol_360M": [
+            0.001,
+            0.01
+          ]
+        },
+        "components": {
+          "complexity_penalty": 9.456634521484375e-06,
+          "convergence": 0.1323780236416497,
+          "cross_scale": 0.1323780236416497,
+          "generalization": 0.28872058832922853,
+          "memory_score": {
+            "base_state_multiplier": 1.0,
+            "penalty": 0.000167,
+            "state_multiplier": 1.012
+          }
+        },
+        "failed_tasks": [],
+        "final_score": 0.16347007269167954,
+        "task_scores": {
+          "FW2_smol_360M": {
+            "base_final_loss": 3.2,
+            "base_gap": 0.0,
+            "base_steps": 188000,
+            "base_time": 72000.0,
+            "convergence": 0.1323780236416497,
+            "gen": 0.28872058832922853,
+            "sub_final_loss": 2.776390324346721,
+            "sub_gap": -0.002887205883292285,
+            "sub_steps": 200495,
+            "sub_time": 72026.08545255661
+          }
+        }
+      },
+      "weight": 0.0
+    }
+  },
+  "tasks": [
+    {
+      "batch_size": 32,
+      "compute_budget_seconds": 72000.0,
+      "data_manifest": "bfef73a8aada7237f1d54c6e96eb90f8da5d2f609dfc7ae51c45dbe2487ac88c",
+      "dataset": "fineweb-edu-shards",
+      "decay_fraction": 0.2,
+      "eval_every": 9400,
+      "eval_sequences": 8192,
+      "model_config": "lean-llama-360m",
+      "parameter_count": "360M",
+      "sequence_length": 2048,
+      "task_id": "FW2_smol_360M",
+      "task_weight": 1.0,
+      "total_steps": 188000,
+      "use_pretrained": false,
+      "warmup_fraction": 0.05
+    }
+  ],
+  "timestamp": 1783260430,
+  "weights": {}
+}
