@@ -2047,7 +2047,8 @@ class TargonOrchestrator:
             if not wrk_uid:
                 audit_emit(audit, "targon.eval.provisioning_failed",
                            round_id=round_id, sub_uid=sub_uid)
-                result = {"failed": True, "error": "rental_provisioning_failed", "score": -1.0}
+                result = {"failed": True, "error": "rental_provisioning_failed", "score": -1.0,
+                          "no_box": True}
                 return result
 
             result = self._provision_and_run(
@@ -2079,6 +2080,13 @@ class TargonOrchestrator:
             result = {"failed": True, "error": "timeout_exceeded", "score": -1.0,
                       "remote_diag": diag}
             return result
+        except CapacityWait as e:
+            log.warning(f"[{sub_uid}] capacity wait during rental: {e}")
+            audit_emit(audit, "targon.eval.capacity_wait", round_id=round_id,
+                       sub_uid=sub_uid, sku=e.sku, waited_s=e.waited_s, error=str(e))
+            result = {"failed": True, "error": f"capacity_wait: {e}", "score": -1.0,
+                      "capacity_wait": True, "no_box": True}
+            return result
         except Exception as e:
             log.error(f"[{wrk_uid or 'no-wrk'}] Eval failed: {e}")
             diag = self._capture_failure_diag(wrk_uid) if wrk_uid else ""
@@ -2088,6 +2096,8 @@ class TargonOrchestrator:
                        diagnostics=diag, crashed=looks_like_crash(str(e)))
             result = {"failed": True, "error": str(e), "score": -1.0,
                       "remote_diag": diag}
+            if not wrk_uid:
+                result["no_box"] = True
             return result
         finally:
             self._release_reserved_spend(expected_cost)

@@ -39,6 +39,20 @@ after a backoff (30 s doubling to 10 min); a pending update is applied before
 the restart, so a broken release is replaced by the fix as soon as it lands.
 A clean exit (0, e.g. a finite ``max_rounds`` run) stops the supervisor.
 
+Urgent updates (``UPDATE_NOW``): a push that adds or changes the file
+``UPDATE_NOW`` at the repository root, or whose commit message contains
+``[update-now]``, is applied without waiting for the round boundary. The flag
+is written with a ``now`` line; the validator abandons the round in progress
+at its next window poll (<= 60 s) or, if it is blocked inside an evaluation,
+the supervisor sends SIGINT after ``SN125_UPDATE_NOW_GRACE_S`` (default 120 s)
+and SIGTERM 60 s later. The abandoned round's audit and state checkpoint are
+still written; the credits debited in it are returned to the miners when the
+validator starts again (roundsm.live._refund_abandoned_rounds). GPU spend on
+the in-flight evaluations is the operator's cost. Rounds already published are
+never affected. The trigger is edge-based (the file must CHANGE between the
+running commit and the pushed one), so leaving ``UPDATE_NOW`` in the tree is
+harmless; bump its contents to trigger again.
+
 Why not Watchtower: it replaces the container the moment a new image appears,
 which is mid-round almost always (rounds are ~24 h), throwing away the
 in-flight evaluations and GPU spend. The safe restart point is only known to
@@ -75,6 +89,14 @@ SUPERVISOR_FLAGS = ("--auto-update", "--update-interval")
 
 _CRASH_BACKOFF_MIN_S = 30.0
 _CRASH_BACKOFF_MAX_S = 600.0
+
+UPDATE_NOW_FILE = "UPDATE_NOW"
+UPDATE_NOW_TAG = "[update-now]"
+RESTART_NOW_MARKER = "now"
+NOW_GRACE_ENV = "SN125_UPDATE_NOW_GRACE_S"
+DEFAULT_NOW_GRACE_S = 120.0
+_NOW_TERM_AFTER_S = 60.0
+_NOW_KILL_AFTER_S = 30.0
 _SMOKE_MODULES = ("sn125.__main__", "sn125.roundsm.live", "sn125.autoupdate")
 
 
@@ -196,6 +218,10 @@ class Repo:
     def changed_between(self, a: str, b: str) -> list[str]:
         out = self.git("diff", "--name-only", a, b)
         return [p for p in out.splitlines() if p]
+
+    def log_messages(self, a: str, b: str) -> str:
+        """Subject+body of every commit reachable from ``b`` but not ``a``."""
+        return self.git("log", "--format=%s%n%b", f"{a}..{b}", check=False)
 
     def is_ancestor(self, a: str, b: str) -> bool:
         return subprocess.run(["git", "-C", str(self.root), "merge-base",
@@ -377,9 +403,13 @@ class Supervisor:
         self.import_smoke = import_smoke
         self.sleep = sleep
         self.flag = self.state_dir / "restart.requested"
+        self.now_grace_s = max(0.0, _env_float(NOW_GRACE_ENV, DEFAULT_NOW_GRACE_S))
         self._proc: subprocess.Popen | None = None
         self._stopping = False
         self._pending: str | None = None
+        self._pending_now = False
+        self._now_requested_at: float | None = None
+        self._now_signals_sent = 0
         self._last_fetch = 0.0
         self._fetch_failures = 0
 
@@ -437,14 +467,61 @@ class Supervisor:
         except FileNotFoundError:
             pass
 
-    def _request_restart(self, target: str) -> None:
-        if self._pending == target:
+    def is_urgent(self, head: str, target: str) -> bool:
+        """True when the pushed range asks to skip the round boundary: the
+        ``UPDATE_NOW`` file was added/changed, or a commit message carries
+        ``[update-now]``."""
+        try:
+            if UPDATE_NOW_FILE in self.repo.changed_between(head, target):
+                return True
+            return UPDATE_NOW_TAG in self.repo.log_messages(head, target).lower()
+        except UpdateError as e:
+            log.warning("could not inspect %s..%s for an urgent marker: %s",
+                        self.repo.short(head), self.repo.short(target), e)
+            return False
+
+    def _request_restart(self, target: str, *, now: bool = False) -> None:
+        if self._pending == target and (self._pending_now or not now):
             return
         self._pending = target
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.flag.write_text(target + "\n", encoding="utf-8")
-        log.info("update available %s -> %s; the validator will restart at its next "
-                 "round boundary", self.repo.short(self.repo.head()), self.repo.short(target))
+        body = target + "\n" + (RESTART_NOW_MARKER + "\n" if now else "")
+        self.flag.write_text(body, encoding="utf-8")
+        if now:
+            self._pending_now = True
+            self._now_requested_at = time.monotonic()
+            self._now_signals_sent = 0
+            log.warning("URGENT update available %s -> %s (%s); the validator abandons "
+                        "the round in progress and restarts now (SIGINT after %.0fs "
+                        "if it is blocked in an evaluation)",
+                        self.repo.short(self.repo.head()), self.repo.short(target),
+                        UPDATE_NOW_FILE, self.now_grace_s)
+        else:
+            log.info("update available %s -> %s; the validator will restart at its "
+                     "next round boundary", self.repo.short(self.repo.head()),
+                     self.repo.short(target))
+
+    def _escalate_now(self, proc: subprocess.Popen) -> None:
+        """After an urgent request: SIGINT once the grace period is over, then
+        SIGTERM, then SIGKILL, so an evaluation-blocked child cannot pin the
+        old code indefinitely."""
+        if self._now_requested_at is None or proc.poll() is not None:
+            return
+        waited = time.monotonic() - self._now_requested_at
+        steps = ((self.now_grace_s, signal.SIGINT, "SIGINT"),
+                 (self.now_grace_s + _NOW_TERM_AFTER_S, signal.SIGTERM, "SIGTERM"),
+                 (self.now_grace_s + _NOW_TERM_AFTER_S + _NOW_KILL_AFTER_S,
+                  signal.SIGKILL, "SIGKILL"))
+        if self._now_signals_sent < len(steps):
+            due, sig, name = steps[self._now_signals_sent]
+            if waited >= due:
+                log.warning("validator still running %.0fs after the urgent request; "
+                            "sending %s", waited, name)
+                try:
+                    proc.send_signal(sig)
+                except OSError:
+                    pass
+                self._now_signals_sent += 1
 
     def _update_before_start(self) -> bool:
         """Apply a pending/available update with nothing running. Returns True
@@ -478,12 +555,21 @@ class Supervisor:
                     self.self_exec()
                     return 0
             self._pending = None
+            self._pending_now = False
+            self._now_requested_at = None
             self._clear_flag()
             self._proc = self._spawn()
             rc = self._monitor(self._proc)
             self._proc = None
             if rc == EXIT_RESTART:
-                log.info("validator stopped at a round boundary for restart")
+                log.info("validator stopped %s for restart",
+                         "mid-round (urgent update)" if self._pending_now
+                         else "at a round boundary")
+                backoff = _CRASH_BACKOFF_MIN_S
+                continue
+            if self._pending_now and not self._stopping:
+                log.warning("validator exited with %s after the urgent request; "
+                            "applying the update and restarting now", rc)
                 backoff = _CRASH_BACKOFF_MIN_S
                 continue
             if self._stopping:
@@ -507,7 +593,10 @@ class Supervisor:
                 next_check = time.monotonic() + self.interval_s
                 target = self.check_upstream()
                 if target is not None:
-                    self._request_restart(target)
+                    urgent = self._pending_now or self.is_urgent(self.repo.head(), target)
+                    self._request_restart(target, now=urgent)
+            if self._pending_now:
+                self._escalate_now(proc)
             self.sleep(min(1.0, self.interval_s))
 
     def _sleep_watching(self, seconds: float) -> None:

@@ -20,6 +20,8 @@ from ..config import (
 
 
 SN125_VERSION_FALLBACK = "0.1.0"
+BURN_KEY = "__BURN__"
+RAO_PER_TAO = 10**9
 
 AUDIENCE_NOTES = {
     "investors": [
@@ -248,6 +250,10 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
 
     tasks = rd.get("tasks", []) or []
     task = tasks[0] if tasks else {}
+    paid_weights = {
+        str(hk): _num(w) for hk, w in (rd.get("weights") or {}).items()
+        if hk != BURN_KEY and _num(w) > 0
+    }
     return {
         "round_id": rd.get("round_id", path.stem),
         "timestamp": int(_num(rd.get("timestamp"), 0)),
@@ -264,6 +270,7 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
         "best_code_hash": submissions.get(best_hotkey, {}).get("code_hash", ""),
         "burned_weight": burned_weight,
         "paid_weight": max(0.0, 1.0 - burned_weight),
+        "paid_weights": paid_weights,
         "base_losses": base_losses,
         "best_loss": best_loss,
         "base_loss": base_loss,
@@ -289,6 +296,7 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
 
 def _leaderboard(rounds: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
     by_hotkey: dict[str, dict[str, Any]] = {}
+    paid_total: dict[str, float] = {}
     for _path, rd in rounds:
         best_hotkey = ""
         best_score = None
@@ -317,13 +325,10 @@ def _leaderboard(rounds: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, An
                 "earned_tokens": 0.0,
             })
             final = _num(score.get("final_score"), -999.0)
-            weight = _num(sub.get("weight", 0.0))
             row["rounds"] += 1
             if hotkey == best_hotkey:
                 row["wins"] += 1
             row["ema_score"] = 0.65 * row["ema_score"] + 0.35 * final if row["rounds"] > 1 else final
-            row["weight"] += weight
-            row["earned_tokens"] += weight * EMISSIONS["miner_daily_tokens"]
             comps = score.get("components", {}) or {}
             for key in row["components"]:
                 row["components"][key] += _num(comps.get(key), 0.0)
@@ -332,6 +337,18 @@ def _leaderboard(rounds: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, An
                 row["code_hash"] = sub.get("code_hash", "")
             family = _optimizer_family(sub, score)
             row["families"][family] = row["families"].get(family, 0) + 1
+        weight_map = rd.get("weights") if isinstance(rd.get("weights"), dict) else None
+        if not weight_map:
+            weight_map = {hk: (sub or {}).get("weight", 0.0)
+                          for hk, sub in (rd.get("submissions", {}) or {}).items()}
+        for hotkey, weight in weight_map.items():
+            w = _num(weight)
+            if hotkey != BURN_KEY and w > 0:
+                paid_total[str(hotkey)] = paid_total.get(str(hotkey), 0.0) + w
+    for hotkey, w in paid_total.items():
+        if hotkey in by_hotkey:
+            by_hotkey[hotkey]["weight"] = w
+            by_hotkey[hotkey]["earned_tokens"] = w * EMISSIONS["miner_daily_tokens"]
 
     rows = []
     for row in by_hotkey.values():
@@ -445,6 +462,311 @@ def _verification(rounds: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _public_payments(ledger_path: Path | None, treasury_coldkey: str,
+                     recent_events: int = 60) -> dict[str, Any]:
+    """Credit ledger view for miners: who holds how many prepaid evaluation
+    credits, what was deposited/spent/refunded, and the latest ledger events.
+    The ledger is public by design (registry.events_json: 'publishable
+    ledger'); nothing here is secret — treasury transfers are on chain."""
+    from ..ops import build_credits
+    base = {"available": False, "treasury_coldkey": treasury_coldkey, "accounts": [],
+            "recent_events": [], "totals": {}}
+    if ledger_path is None:
+        return {**base, "reason": "no ledger configured"}
+    try:
+        credits = build_credits(Path(ledger_path), recent_events=recent_events)
+    except Exception as exc:
+        return {**base, "reason": f"{type(exc).__name__}: {exc}"}
+    if not credits.get("available"):
+        return {**base, "reason": credits.get("reason") or credits.get("error", "")}
+    accounts = []
+    for ck, r in (credits.get("coldkeys") or {}).items():
+        accounts.append({
+            "coldkey": ck, "credits": int(r.get("credits") or 0),
+            "carry_rao": int(r.get("carry_rao") or 0),
+            "carry_tao": _num(r.get("carry_tao")),
+            "deposits": int(r.get("deposits") or 0),
+            "deposited_tao": _num(r.get("deposited_tao")),
+            "granted": int(r.get("granted") or 0), "debited": int(r.get("debited") or 0),
+            "refunded": int(r.get("refunded") or 0),
+            "hotkeys": list(r.get("hotkeys") or []),
+            "last_round_id": r.get("last_round_id"),
+        })
+    accounts.sort(key=lambda a: (-a["credits"], -a["deposited_tao"], a["coldkey"]))
+    events = []
+    for ev in credits.get("recent_events") or []:
+        if not isinstance(ev, dict):
+            continue
+        events.append({
+            "seq": ev.get("seq"), "kind": ev.get("kind"), "round_id": ev.get("round_id"),
+            "coldkey": ev.get("coldkey"), "hotkey": ev.get("hotkey"),
+            "credits": int(ev.get("credits") or 0),
+            "tao": _num(ev.get("rao")) / RAO_PER_TAO if ev.get("rao") else 0.0,
+            "carry_tao": _num(ev.get("carry_rao")) / RAO_PER_TAO if ev.get("carry_rao") else 0.0,
+            "tx_id": ev.get("tx_id"), "note": ev.get("note", ""),
+        })
+    fee_rao = credits.get("fee_rao")
+    return {
+        "available": True,
+        "treasury_coldkey": treasury_coldkey,
+        "fee_rao": fee_rao,
+        "fee_tao": _num(fee_rao) / RAO_PER_TAO if fee_rao else None,
+        "updated_at": credits.get("ledger_updated_at"),
+        "last_block": credits.get("last_block"),
+        "pinned_rounds": credits.get("pinned_rounds") or {},
+        "totals": credits.get("totals") or {},
+        "events_total": credits.get("events_total", len(events)),
+        "accounts": accounts,
+        "recent_events": events[::-1],
+    }
+
+
+def _public_queue(state_path: Path | None) -> dict[str, Any]:
+    """Deferred (paid, waiting) commits from the loop-state checkpoint."""
+    from ..ops import _queue_from_state
+    try:
+        q = _queue_from_state(Path(state_path) if state_path else None)
+    except Exception as exc:
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}", "deferred": []}
+    return {
+        "available": bool(q.get("available")),
+        "reason": q.get("reason") or q.get("error"),
+        "round_num": q.get("round_num"),
+        "last_round_id": q.get("last_round_id"),
+        "state_saved_at": q.get("state_saved_at"),
+        "deferred": [
+            {k: s.get(k) for k in ("position", "hotkey", "coldkey", "commit_hash",
+                                   "deferrals", "accepted_at")}
+            for s in (q.get("deferred_queue") or [])
+        ],
+    }
+
+
+def _public_live_round(audit_dir: Path | None) -> dict[str, Any] | None:
+    """The round in progress (from its audit trail), or None between rounds."""
+    from ..ops import _live_round
+    try:
+        live = _live_round(Path(audit_dir) if audit_dir else None)
+    except Exception:
+        return None
+    if not isinstance(live, dict) or not live.get("round_id"):
+        return None
+    subs = []
+    for s in live.get("submissions") or []:
+        subs.append({k: s.get(k) for k in (
+            "hotkey", "coldkey", "commit_hash", "status", "last_event", "last_event_ts",
+            "reason", "score", "outcome", "deferrals", "selection_rank", "credit_balance",
+            "timeline")})
+    return {
+        "round_id": live.get("round_id"), "phase": live.get("phase"),
+        "started_at": live.get("started_at"), "round_period_s": live.get("round_period_s"),
+        "last_event_at": live.get("last_event_at"),
+        "events": live.get("events"), "submissions": subs,
+    }
+
+
+def _submission_loss(sub: dict[str, Any]) -> tuple[float | None, float | None]:
+    """(held-out loss, baseline loss) for one scored submission, from its
+    task_scores or, failing that, the last eval point of its curve."""
+    score = _as_score(sub)
+    sub_loss = base_loss = None
+    for ts_rec in (score.get("task_scores", {}) or {}).values():
+        if not isinstance(ts_rec, dict):
+            continue
+        if ts_rec.get("sub_final_loss") is not None:
+            sub_loss = _num(ts_rec.get("sub_final_loss"))
+        if ts_rec.get("base_final_loss") is not None:
+            base_loss = _num(ts_rec.get("base_final_loss"))
+        break
+    if sub_loss is None:
+        for curve in (sub.get("curves", {}) or {}).values():
+            if isinstance(curve, dict):
+                sub_loss = _point_loss(curve.get("eval_points", []) or [])
+                if sub_loss is not None:
+                    break
+    if sub_loss is None:
+        for key in ("sub_final_loss", "final_loss", "loss"):
+            if score.get(key) is not None:
+                sub_loss = _num(score.get(key))
+                break
+    return sub_loss, base_loss
+
+
+def _is_miner_key(key: Any, known: dict[str, Any]) -> bool:
+    """Weight-map keys are hotkeys plus the burn sentinel; accept known hotkeys
+    and anything shaped like an ss58 address, never the sentinel."""
+    k = str(key)
+    return k != BURN_KEY and (k in known or (len(k) >= 40 and k[0] == "5"))
+
+
+def _miners_index(round_pairs: list[tuple[Path, dict[str, Any]]],
+                  summaries: list[dict[str, Any]], leaderboard: list[dict[str, Any]],
+                  payments: dict[str, Any], queue: dict[str, Any],
+                  live: dict[str, Any] | None, latest: dict[str, Any] | None,
+                  miner_daily_tokens: float) -> list[dict[str, Any]]:
+    """Hotkey-first view: one record per hotkey that has ever committed, with
+    its per-round history, money (via its coldkey), payout and what it is
+    doing right now. This is the dashboard's primary layer; every other panel
+    is an aggregate of it."""
+    by_hk: dict[str, dict[str, Any]] = {}
+    lb = {r["hotkey"]: r for r in leaderboard}
+    ck_of: dict[str, str] = {}
+    accounts = {a["coldkey"]: a for a in (payments.get("accounts") or [])}
+    for a in accounts.values():
+        for hk in a.get("hotkeys") or []:
+            ck_of[str(hk)] = a["coldkey"]
+
+    def rec(hk: str) -> dict[str, Any]:
+        return by_hk.setdefault(hk, {
+            "hotkey": hk, "coldkey": None, "family": None, "code_hash_short": None,
+            "credits": None, "carry_tao": 0.0, "deposited_tao": 0.0, "spent": 0, "refunded": 0,
+            "earned_tokens": 0.0, "weight_now": 0.0,
+            "best_loss": None, "best_round_id": None, "last_loss": None, "last_round_id": None,
+            "last_seen": 0, "rounds_scored": 0, "rounds_dq": 0, "rounds_deferred": 0, "rounds_expired": 0,
+            "frontier_events": 0, "pending_confirmation": False, "is_leader": False,
+            "status": {"state": "idle", "detail": "", "since": None},
+            "history": [],
+        })
+
+    frontier_by_round = {s["round_id"]: s for s in summaries}
+    for path, rd in reversed(round_pairs):
+        rid = str(rd.get("round_id", path.stem))
+        ts = _num(rd.get("timestamp"))
+        summ = frontier_by_round.get(rid) or {}
+        subs = rd.get("submissions", {}) or {}
+        weights = rd.get("weights") if isinstance(rd.get("weights"), dict) else {}
+        report = rd.get("fsm_report", {}) or {}
+        seen: set[str] = set()
+        for s in report.get("submissions") or []:
+            if not isinstance(s, dict) or not s.get("hotkey"):
+                continue
+            hk = str(s["hotkey"])
+            seen.add(hk)
+            r = rec(hk)
+            status = str(s.get("status") or "")
+            sub = subs.get(hk) or {}
+            loss, base = _submission_loss(sub) if sub else (None, None)
+            if base is None:
+                base = summ.get("base_loss")
+            entry = {"round_id": rid, "timestamp": ts, "status": status, "loss": loss,
+                     "base_loss": base, "score": s.get("score"),
+                     "weight": _num(weights.get(hk, (sub or {}).get("weight", 0.0))),
+                     "deferrals": int(_num(s.get("deferrals"))),
+                     "commit_hash": s.get("commit_hash")}
+            r["history"].append(entry)
+            r["last_seen"] = max(r["last_seen"], ts)
+            r["last_round_id"] = rid
+            if status == "scored":
+                r["rounds_scored"] += 1
+                if loss is not None:
+                    r["last_loss"] = loss
+                    if r["best_loss"] is None or loss < r["best_loss"]:
+                        r["best_loss"], r["best_round_id"] = loss, rid
+            elif status == "deferred":
+                r["rounds_deferred"] += 1
+            elif status == "expired":
+                r["rounds_expired"] = r.get("rounds_expired", 0) + 1
+            elif status:
+                r["rounds_dq"] += 1
+            if sub:
+                fam = _optimizer_family(sub, _as_score(sub))
+                r["family"] = fam
+                if sub.get("code_hash"):
+                    r["code_hash_short"] = str(sub["code_hash"])[:12]
+        for hk, sub in subs.items():
+            if hk in seen or not isinstance(sub, dict):
+                continue
+            r = rec(str(hk))
+            loss, base = _submission_loss(sub)
+            scored = _as_score(sub).get("final_score") is not None
+            r["history"].append({"round_id": rid, "timestamp": ts,
+                                 "status": "scored" if scored else "dq", "loss": loss,
+                                 "base_loss": base or summ.get("base_loss"),
+                                 "score": _as_score(sub).get("final_score"),
+                                 "weight": _num(weights.get(hk, sub.get("weight", 0.0))),
+                                 "deferrals": 0, "commit_hash": sub.get("code_hash")})
+            r["last_seen"] = max(r["last_seen"], ts)
+            r["last_round_id"] = rid
+            if scored:
+                r["rounds_scored"] += 1
+                if loss is not None:
+                    r["last_loss"] = loss
+                    if r["best_loss"] is None or loss < r["best_loss"]:
+                        r["best_loss"], r["best_round_id"] = loss, rid
+            else:
+                r["rounds_dq"] += 1
+            r["family"] = _optimizer_family(sub, _as_score(sub))
+            if sub.get("code_hash"):
+                r["code_hash_short"] = str(sub["code_hash"])[:12]
+        for hk, w in weights.items():
+            if _is_miner_key(hk, by_hk) and _num(w) > 0:
+                rec(str(hk))["earned_tokens"] += _num(w) * miner_daily_tokens
+
+    fr = (latest or {}).get("frontier_rewards") or {}
+    newest_weights = (latest or {}).get("weights") or {}
+    for hk, w in newest_weights.items():
+        if _is_miner_key(hk, by_hk) and _num(w) > 0:
+            rec(str(hk))["weight_now"] = _num(w)
+    for ev in fr.get("events") or []:
+        if isinstance(ev, dict) and ev.get("hotkey"):
+            rec(str(ev["hotkey"]))["frontier_events"] += 1
+    for p in fr.get("pending_confirmation") or []:
+        if isinstance(p, dict) and p.get("hotkey"):
+            rec(str(p["hotkey"]))["pending_confirmation"] = True
+    if fr.get("leader_hotkey"):
+        rec(str(fr["leader_hotkey"]))["is_leader"] = True
+
+    for q in queue.get("deferred") or []:
+        if q.get("hotkey"):
+            r = rec(str(q["hotkey"]))
+            r["status"] = {"state": "queued", "detail": f"deferred {q.get('deferrals') or 0}×, position {q.get('position')}",
+                           "since": q.get("accepted_at")}
+            if q.get("coldkey"):
+                ck_of.setdefault(str(q["hotkey"]), str(q["coldkey"]))
+    for s in (live or {}).get("submissions") or []:
+        if not s.get("hotkey"):
+            continue
+        r = rec(str(s["hotkey"]))
+        r["status"] = {"state": str(s.get("status") or "committed"),
+                       "detail": s.get("reason") or "", "since": s.get("last_event_ts"),
+                       "round_id": (live or {}).get("round_id"),
+                       "commit_hash": s.get("commit_hash"),
+                       "credit_balance": s.get("credit_balance"),
+                       "timeline": list(s.get("timeline") or [])}
+        if s.get("coldkey"):
+            ck_of.setdefault(str(s["hotkey"]), str(s["coldkey"]))
+    for hk, r in by_hk.items():
+        if r["status"]["state"] == "idle":
+            last = r["history"][-1] if r["history"] else None
+            if r["pending_confirmation"]:
+                r["status"] = {"state": "pending", "detail": "candidate awaiting confirmation rerun", "since": r["last_seen"]}
+            elif r["is_leader"]:
+                r["status"] = {"state": "leader", "detail": "confirmed frontier leader", "since": r["last_seen"]}
+            elif last:
+                r["status"] = {"state": last["status"] or "idle", "detail": "last round " + last["round_id"][:13],
+                               "since": last["timestamp"]}
+        ck = ck_of.get(hk)
+        r["coldkey"] = ck
+        acct = accounts.get(ck) if ck else None
+        if acct:
+            r["credits"] = acct.get("credits")
+            r["carry_tao"] = acct.get("carry_tao", 0.0)
+            r["deposited_tao"] = acct.get("deposited_tao", 0.0)
+            r["spent"] = acct.get("debited", 0)
+            r["refunded"] = acct.get("refunded", 0)
+            r["coldkey_hotkeys"] = [h for h in acct.get("hotkeys") or [] if h != hk]
+        row = lb.get(hk)
+        if row:
+            r["family"] = r["family"] or row.get("family")
+            r["code_hash_short"] = r["code_hash_short"] or row.get("code_hash_short")
+            r["best_score"] = row.get("best_score")
+            r["rank"] = row.get("rank")
+
+    def sort_key(r: dict[str, Any]):
+        return (r["best_loss"] if r["best_loss"] is not None else float("inf"), -r["last_seen"], r["hotkey"])
+    return sorted(by_hk.values(), key=sort_key)
+
+
 def build_dashboard_data(
     rounds_dir: Path,
     cloud_status_path: Path | None = None,
@@ -452,8 +774,20 @@ def build_dashboard_data(
     version: str = SN125_VERSION_FALLBACK,
     validator_hotkey: str = "local-dev",
     live_sources: dict[str, Any] | None = None,
+    ledger_path: Path | None = None,
+    state_path: Path | None = None,
+    audit_dir: Path | None = None,
+    treasury_coldkey: str | None = None,
 ) -> dict[str, Any]:
-    """Build the public dashboard JSON from round artifacts."""
+    """Build the public dashboard JSON from round artifacts.
+
+    ``ledger_path`` / ``state_path`` / ``audit_dir`` (optional) add the
+    operations sections miners watch between rounds: ``payments`` (credit
+    ledger), ``queue`` (deferred commits) and ``live_round`` (the round in
+    progress). Absent inputs degrade to ``available: False`` / ``None``."""
+    if treasury_coldkey is None:
+        from .. import config as _config
+        treasury_coldkey = getattr(_config, "TREASURY_COLDKEY", "") or ""
     round_pairs: list[tuple[Path, dict[str, Any]]] = []
     for path in _round_files(rounds_dir)[:240]:
         rd = _read_json(path, {})
@@ -493,6 +827,9 @@ def build_dashboard_data(
     miner_daily_tokens = EMISSIONS["miner_daily_tokens"]
     latest_paid_tokens = miner_daily_tokens * max(0.0, 1.0 - latest_burn)
     latest_burned_tokens = miner_daily_tokens * latest_burn
+    payments = _public_payments(ledger_path, treasury_coldkey)
+    queue = _public_queue(state_path)
+    live_round = _public_live_round(audit_dir)
     total_paid_tokens = sum(r["paid_weight"] * miner_daily_tokens for r in summaries)
     total_burned_tokens = sum(r["burned_weight"] * miner_daily_tokens for r in summaries)
 
@@ -547,6 +884,11 @@ def build_dashboard_data(
         },
         "capacity_delay": capacity_delay,
         "audit": audit,
+        "payments": payments,
+        "queue": queue,
+        "live_round": live_round,
+        "miners": _miners_index(round_pairs, summaries, leaderboard, payments, queue,
+                                live_round, latest, miner_daily_tokens),
         "current_round": latest_summary,
         "leaderboard": leaderboard,
         "history": summaries,
@@ -579,6 +921,7 @@ def build_dashboard_json(
     version: str = SN125_VERSION_FALLBACK,
     validator_hotkey: str = "local-dev",
     live_sources: dict[str, Any] | None = None,
+    **operations: Any,
 ) -> str:
     return json.dumps(
         build_dashboard_data(
@@ -587,6 +930,7 @@ def build_dashboard_json(
             version=version,
             validator_hotkey=validator_hotkey,
             live_sources=live_sources,
+            **operations,
         ),
         default=str,
     )

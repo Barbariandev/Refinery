@@ -44,6 +44,7 @@ back-to-back (the sequential per-item ``evaluate`` path stays for tests).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
@@ -62,9 +63,12 @@ from .adapter import (
     make_commit_collector,
     make_reveal_collector,
     make_source_gate,
+    is_no_gpu_failure,
+    no_box_ran,
 )
 from .audit import JsonlAuditLog, audit_emit, looks_like_crash, payload_record
-from .driver import DEFAULT_OUTAGE_BACKOFF_S, EvalResult, drive_round
+from .driver import (DEFAULT_LAUNCH_RETRY_S, DEFAULT_LAUNCH_WINDOW_S,
+                     DEFAULT_OUTAGE_BACKOFF_S, EvalResult, drive_round)
 from .round_fsm import MAX_EVAL_PER_ROUND, RoundConfig, RoundFSM, SubStatus
 from .state import default_state_path, load_loop_state, save_loop_state
 
@@ -225,6 +229,36 @@ def _round_config(validator, round_id: str, fee_rao: int,
     )
 
 
+def _env_or_attr_float(validator, attr: str, env: str, default: float) -> float:
+    """Operator knob: ``validator.<attr>`` if set, else ``$<env>``, else default."""
+    val = getattr(validator, attr, None)
+    if val is None:
+        raw = os.environ.get(env, "").strip()
+        if raw:
+            try:
+                val = float(raw)
+            except ValueError:
+                log.warning("%s=%r is not a number; using %s", env, raw, default)
+                val = None
+    return float(default if val is None else val)
+
+
+def _launch_window_s(validator) -> float:
+    """How long after selection the round keeps trying to START evaluations
+    (``fsm_launch_window_s`` / ``SN125_LAUNCH_WINDOW_S``, default 4h). Sporadic
+    B200 inventory inside the window is picked up; work still un-started at the
+    end carries to the next round with its credit."""
+    return max(0.0, _env_or_attr_float(validator, "fsm_launch_window_s",
+                                       "SN125_LAUNCH_WINDOW_S", DEFAULT_LAUNCH_WINDOW_S))
+
+
+def _launch_retry_s(validator) -> float:
+    """Inventory poll cadence inside the launch window (``fsm_launch_retry_s`` /
+    ``SN125_LAUNCH_RETRY_S``, default 300s)."""
+    return max(0.0, _env_or_attr_float(validator, "fsm_launch_retry_s",
+                                       "SN125_LAUNCH_RETRY_S", DEFAULT_LAUNCH_RETRY_S))
+
+
 def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
                       max_concurrent: int, audit=None,
                       baseline_bundle: dict | None = None):
@@ -235,14 +269,39 @@ def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
     ``ScoreRecord``s (components/curves) for ``compute_weights`` afterwards."""
     orch = validator._cloud_orch
     mode = getattr(validator, "mode", "prod")
+    poll_s = max(1.0, _launch_retry_s(validator))
+    stop = threading.Event()
 
-    def _one(item: tuple[str, bytes]):
-        commit_hash, payload = item
-        source = payload.decode("utf-8", errors="replace")
-        sub_uid = commit_hash[:18]
+    def _has_capacity() -> bool:
+        probe = getattr(orch, "has_b200_capacity", None)
+        if probe is None:
+            return True
+        try:
+            return bool(probe())
+        except Exception:
+            return False
+
+    def _wait_for_box(commit_hash: str, sub_uid: str, deadline: float | None) -> bool:
+        """After a no-box failure: poll B200 inventory every ``poll_s`` until a slot
+        appears (True) or the launch window closes / restart requested (False).
+        This is what lets a submission pick up a GPU that shows up at hour three."""
+        if deadline is None:
+            return False
+        while not stop.is_set():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            if _has_capacity():
+                return True
+            stop.wait(min(poll_s, remaining))
+        return False
+
+    def _attempt(commit_hash: str, payload: bytes, source: str, sub_uid: str,
+                 attempt: int):
         started = time.time()
         audit_emit(audit, "cloud_eval.start", commit_hash=commit_hash,
-                   sub_uid=sub_uid, mode=mode, resource=getattr(validator, "cloud_resource", ""),
+                   sub_uid=sub_uid, mode=mode, attempt=attempt,
+                   resource=getattr(validator, "cloud_resource", ""),
                    **payload_record(payload))
         try:
             try:
@@ -269,23 +328,55 @@ def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
         verdict = classify_cloud_result(res)
         err = str(res.get("error", ""))
         audit_emit(audit, "cloud_eval.result", commit_hash=commit_hash,
-                   sub_uid=sub_uid, mode=mode, elapsed_s=time.time() - started,
+                   sub_uid=sub_uid, mode=mode, attempt=attempt,
+                   elapsed_s=time.time() - started,
                    outcome=verdict.outcome, score=verdict.score,
                    reason=verdict.reason, failed=bool(res.get("failed")),
                    error=err, crashed=looks_like_crash(err),
                    raw_result=res)
         return commit_hash, res, verdict
 
-    def evaluate_batch(payloads: list[tuple[str, bytes]]) -> dict[str, EvalResult]:
+    def _one(item: tuple[str, bytes], deadline: float | None = None):
+        """Run one submission; inside the launch window a *no-box* failure (zero
+        inventory, rental never provisioned) is not final: wait for a slot and
+        launch again. Failures with a box (miner code ran) are returned as-is."""
+        commit_hash, payload = item
+        source = payload.decode("utf-8", errors="replace")
+        sub_uid = commit_hash[:18]
+        attempt = 0
+        while True:
+            attempt += 1
+            commit_hash, raw, ev = _attempt(commit_hash, payload, source, sub_uid, attempt)
+            if (ev.outcome == "flake" and raw is not None and no_box_ran(raw)
+                    and deadline is not None and time.time() < deadline):
+                audit_emit(audit, "cloud_eval.awaiting_box", commit_hash=commit_hash,
+                           sub_uid=sub_uid, attempt=attempt, reason=ev.reason,
+                           launch_deadline=deadline)
+                log.info("    %s: no GPU on attempt %d (%s); polling inventory "
+                         "until %s", sub_uid, attempt, ev.reason[:60],
+                         time.strftime("%H:%M:%S", time.localtime(deadline)))
+                if _wait_for_box(commit_hash, sub_uid, deadline):
+                    continue
+            return commit_hash, raw, ev
+
+    def evaluate_batch(payloads: list[tuple[str, bytes]],
+                       launch_deadline: float | None = None) -> dict[str, EvalResult]:
         out: dict[str, EvalResult] = {}
         if not payloads:
             return out
         workers = min(max_concurrent, len(payloads))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for commit_hash, raw, ev in ex.map(_one, payloads):
+        ex = ThreadPoolExecutor(max_workers=workers)
+        try:
+            for commit_hash, raw, ev in ex.map(
+                    lambda item: _one(item, launch_deadline), payloads):
                 if raw is not None:
                     sink[commit_hash] = raw
                 out[commit_hash] = ev
+        except BaseException:
+            stop.set()
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
+        ex.shutdown(wait=True)
         return out
 
     return evaluate_batch
@@ -310,10 +401,16 @@ def _make_capacity_wait(validator, round_id: str):
     if orch is None or not hasattr(orch, "wait_for_b200_capacity"):
         return None
 
-    def await_capacity(emit):
+    def await_capacity(emit, max_wait_s: float | None = None):
+        """``max_wait_s`` (the driver passes the remaining launch window) bounds
+        the wait; the orchestrator raises ``CapacityWait`` when it expires and the
+        driver then carries the un-started submissions to the next round."""
         orch.begin_capacity_wait(round_id)
         try:
-            orch.wait_for_b200_capacity(on_event=emit)
+            if max_wait_s is not None and max_wait_s > 0:
+                orch.wait_for_b200_capacity(on_event=emit, max_wait_s=float(max_wait_s))
+            else:
+                orch.wait_for_b200_capacity(on_event=emit)
         finally:
             orch.clear_capacity_wait()
 
@@ -446,7 +543,9 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
     ``round_fee_rao``, and the ``commit_synapse_cls`` / ``submission_synapse_cls``
     transport classes. Optional knobs: ``fsm_commit_window_s``,
     ``fsm_reveal_window_s``, ``fsm_round_period_s``, ``fsm_max_concurrent``,
-    ``fsm_fairness_window``.
+    ``fsm_fairness_window``, ``fsm_launch_window_s`` (or ``$SN125_LAUNCH_WINDOW_S``;
+    how long the round keeps trying to start evaluations on sporadic GPU
+    inventory, default 4h), ``fsm_launch_retry_s`` (inventory poll cadence).
     """
     reg = validator.payment_registry
     fee_rao = int(validator.round_fee_rao)
@@ -504,10 +603,13 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
         weight_refresh_stop = _start_weight_refresh(validator)
     publisher = _start_artifact_publisher(validator)
     payment_watch_stop = _start_payment_watcher(validator, reg, fee_rao)
+    _reconcile_ledger_at_startup(validator, reg)
     rounds_this_process = 0
     while max_rounds is None or rounds_this_process < max_rounds:
         round_start = clock()
         round_id = f"round_{round_num:06d}_{int(round_start)}_{vhk}"
+        operator_interrupt: BaseException | None = None
+        nothing_launched = False
         audit = _make_round_audit(validator, round_id)
         heartbeat_stop = _start_validator_heartbeat(validator, audit, round_start, clock)
         log.info("=" * 60)
@@ -610,10 +712,13 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                                                  baseline_bundle=baseline_bundle),
                 recent_hotkeys=recent_hotkeys,
                 carryover=carryover,
-                sleep_until=lambda ts: _sleep_until(ts, clock, sleep),
+                sleep_until=lambda ts: _sleep_until(
+                    ts, clock, sleep, abort=lambda: _restart_now_requested(validator)),
                 clock=clock,
                 outage_backoff_s=float(getattr(validator, "fsm_outage_backoff_s",
                                                DEFAULT_OUTAGE_BACKOFF_S)),
+                launch_window_s=_launch_window_s(validator),
+                launch_retry_s=_launch_retry_s(validator),
                 max_eval=round_max_eval,
                 check_capacity=_make_capacity_check(validator),
                 await_capacity=_make_capacity_wait(validator, round_id),
@@ -636,8 +741,12 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
             carryover = outcome.carryover
             recent_rounds.append(set(outcome.scores.keys()))
             del recent_rounds[:-fairness_window]
-            log.info("  round %s: %d scored, %d deferred",
-                     round_id, len(outcome.scores), len(outcome.deferred))
+            unlaunched = list(getattr(outcome, "unlaunched", []) or [])
+            nothing_launched = bool(outcome.selected) and \
+                len(unlaunched) >= len(outcome.selected)
+            log.info("  round %s: %d scored, %d deferred%s",
+                     round_id, len(outcome.scores), len(outcome.deferred),
+                     f", {len(unlaunched)} never got a GPU (carried)" if unlaunched else "")
 
             results, sources, curve_data = _build_results(fsm, cloud_sink)
             confirmations: dict = {}
@@ -719,6 +828,21 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                         log.warning("  metagraph refresh failed, using stale: %s", e)
                     validator._set_weights_on_chain(meta, weights)
                     audit_emit(audit, "weights.set_on_chain", weights=weights)
+        except (RestartNow, KeyboardInterrupt) as e:
+            if isinstance(e, KeyboardInterrupt) and not _restart_now_requested(validator):
+                audit_emit(audit, "round.aborted", reason="interrupted by operator",
+                           elapsed_s=clock() - round_start)
+                log.warning("  round %s ABANDONED (operator interrupt); credits debited "
+                            "in it are returned when the validator starts again", round_id)
+                operator_interrupt = e
+            else:
+                audit_emit(audit, "round.aborted",
+                           reason="immediate restart requested (update)",
+                           elapsed_s=clock() - round_start)
+                log.warning("  round %s ABANDONED for an immediate restart; credits "
+                            "debited in it are returned when the validator starts again",
+                            round_id)
+                restart_reason = "restart"
         except Exception as e:
             audit_emit(audit, "round.exception", error=str(e),
                        error_type=type(e).__name__, traceback=traceback.format_exc())
@@ -742,8 +866,14 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                 except Exception as e:
                     log.error("  could not checkpoint validator state to %s: %s",
                               state_path, e)
-            if _restart_requested(validator):
+            if restart_reason is not None or operator_interrupt is not None:
+                pass
+            elif _restart_requested(validator):
                 restart_reason = "restart"
+            elif nothing_launched:
+                log.info("  no GPU during the launch window; opening the next round now "
+                         "(%d carried commit(s) keep their credits and priority)",
+                         len(carryover))
             else:
                 remaining = round_period_s - (clock() - round_start)
                 if remaining > 0:
@@ -754,10 +884,23 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                         restart_reason = "restart"
                         break
                     remaining = round_period_s - (clock() - round_start)
+        if operator_interrupt is not None:
+            _stop_background(weight_refresh_stop, payment_watch_stop, publisher)
+            raise operator_interrupt
         if restart_reason is not None:
-            log.info("  restart requested; stopping at the round boundary after "
-                     "round #%d (state checkpointed to %s)", round_num - 1, state_path)
+            log.info("  restart requested; stopping after round #%d "
+                     "(state checkpointed to %s)", round_num - 1, state_path)
             break
+    _stop_background(weight_refresh_stop, payment_watch_stop, publisher)
+    if restart_reason is not None:
+        try:
+            validator.restart_requested = True
+        except Exception:
+            pass
+    return restart_reason
+
+
+def _stop_background(weight_refresh_stop, payment_watch_stop, publisher) -> None:
     if weight_refresh_stop is not None:
         weight_refresh_stop.set()
     if payment_watch_stop is not None:
@@ -767,12 +910,6 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
             publisher.stop(flush=True)
         except Exception as e:
             log.warning("artifact publisher shutdown failed: %s", e)
-    if restart_reason is not None:
-        try:
-            validator.restart_requested = True
-        except Exception:
-            pass
-    return restart_reason
 
 
 def _state_path_for(validator) -> Path | None:
@@ -803,6 +940,296 @@ def _restart_requested(validator) -> bool:
         return flag is not None and flag.exists()
     except OSError:
         return False
+
+
+RESTART_NOW_MARKER = "now"
+
+
+def _restart_now_requested(validator) -> bool:
+    """True when the supervisor asked for an IMMEDIATE restart (urgent update):
+    the flag file carries a ``now`` line. The round in progress is abandoned;
+    its debited credits are returned at the next start-up
+    (:func:`_refund_abandoned_rounds`)."""
+    if bool(getattr(validator, "restart_now_requested", False)):
+        return True
+    flag = _restart_flag_path(validator)
+    if flag is None:
+        return False
+    try:
+        lines = flag.read_text(encoding="utf-8").split()
+    except OSError:
+        return False
+    return RESTART_NOW_MARKER in lines
+
+
+class RestartNow(Exception):
+    """Raised inside a round when an immediate restart was requested."""
+
+
+_BURNED_EVENTS = ("gate.dq", "submission.unrevealed")
+_SETTLED_EVENTS = ("round.published", "round.saved", "weights.computed")
+
+
+def _audit_round_status(audit_dir: Path, round_id: str) -> tuple[bool | None, set[str]]:
+    """(settled?, hotkeys whose credit was burned by a miner-fault outcome)
+    from the round's audit JSONL. A missing audit file => (None, set()): we
+    have no evidence either way, so the caller leaves the round alone."""
+    path = audit_dir / f"{round_id}.jsonl"
+    settled, burned = False, set()
+    if not path.exists():
+        return None, burned
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                ev = rec.get("event")
+                if ev in _SETTLED_EVENTS:
+                    settled = True
+                elif ev in _BURNED_EVENTS and rec.get("hotkey"):
+                    burned.add(str(rec["hotkey"]))
+                elif (ev == "evaluation.finalized" and rec.get("hotkey")
+                      and rec.get("status") in (SubStatus.DQ.value,
+                                                SubStatus.EXPIRED.value)):
+                    burned.add(str(rec["hotkey"]))
+    except OSError:
+        pass
+    return settled, burned
+
+
+NO_GPU_RESTITUTION_TAG = "no-GPU restitution"
+RECONCILIATION_FILE = "payments_reconciliation.jsonl"
+
+
+def _software_version() -> str:
+    try:
+        from ..neuron import SN125_VERSION
+        return str(SN125_VERSION)
+    except Exception:
+        return "unknown"
+
+
+def _reconcile_ledger_at_startup(validator, reg) -> dict:
+    """Run every startup ledger correction and leave one durable record of it.
+
+    Credit lifecycle (the rules the corrections enforce):
+      paid          TAO to the treasury -> ``grant`` (remainder carried per coldkey)
+      accepted      ``debit``: the credit is HELD by that commit
+      evaluated     scored or miner-fault DQ: the credit is consumed
+      infra fault   box ran, our side failed: ``refund``
+      no GPU        commit carried to the next round with the credit and FIFO
+                    priority, round after round; after 30 carries and 30 days
+                    it expires and the credit is absorbed
+      abandoned     the round never published: every debit not burned by miner
+                    fault is refunded (``_refund_abandoned_rounds``)
+      misrecorded   a no-GPU failure a past version burned as miner fault:
+                    restitution refund (``_refund_no_gpu_dqs``)
+
+    Each pass is idempotent (it re-reads the ledger it appends to) so restarts
+    are safe. The outcome is appended to ``<audit_dir>/payments_reconciliation
+    .jsonl`` so the correction is visible in the published logbook even when
+    nothing was owed."""
+    before = len(getattr(reg, "events", []) or [])
+    counts: dict[str, int] = {}
+    errors: dict[str, str] = {}
+    for name, fn in (("abandoned_rounds", _refund_abandoned_rounds),
+                     ("no_gpu_restitution", _refund_no_gpu_dqs)):
+        try:
+            counts[name] = int(fn(validator, reg) or 0)
+        except Exception as e:
+            errors[name] = f"{type(e).__name__}: {e}"
+            log.error("  ledger reconciliation (%s) failed: %s", name, e)
+    new_events = list(getattr(reg, "events", []) or [])[before:]
+    record = {
+        "ts": time.time(),
+        "version": _software_version(),
+        "refunds": counts,
+        "errors": errors,
+        "events": [
+            {"kind": ev.kind, "round_id": ev.round_id, "coldkey": ev.coldkey,
+             "hotkey": getattr(ev, "hotkey", None), "credits": ev.credits,
+             "note": ev.note}
+            for ev in new_events
+        ],
+    }
+    total = sum(counts.values())
+    if total or errors:
+        log.warning("  ledger reconciliation: %d credit(s) returned %s%s",
+                    total, counts, f"; errors {errors}" if errors else "")
+    else:
+        log.info("  ledger reconciliation: nothing owed")
+    try:
+        audit_dir = _audit_dir_for(validator)
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        with (audit_dir / RECONCILIATION_FILE).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception as e:
+        log.warning("  could not write %s: %s", RECONCILIATION_FILE, e)
+    return record
+
+
+def _no_gpu_dqs_in_audit(audit_dir: Path, round_id: str) -> list[tuple[str, str, str]]:
+    """(coldkey, hotkey, reason) for every commit the round's audit finalized as
+    a miner-fault DQ whose recorded reason says no box was ever rented
+    (adapter.is_no_gpu_failure). Missing audit file => []."""
+    path = audit_dir / f"{round_id}.jsonl"
+    out: list[tuple[str, str, str]] = []
+    if not path.exists():
+        return out
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if (rec.get("event") == "evaluation.finalized"
+                        and rec.get("status") == SubStatus.DQ.value
+                        and rec.get("hotkey") and rec.get("coldkey")
+                        and is_no_gpu_failure(str(rec.get("reason") or ""))):
+                    out.append((str(rec["coldkey"]), str(rec["hotkey"]),
+                                str(rec.get("reason") or "")))
+    except OSError:
+        pass
+    return out
+
+
+def _refund_no_gpu_dqs(validator, reg) -> int:
+    """Restitution for credits burned by a no-GPU failure misread as miner fault.
+
+    Before 0.2.2 a ``CapacityWait`` raised inside ``evaluate_submission`` (zero
+    B200 inventory at rental time) came back as a failed result whose error
+    string matched no marker, so ``classify_cloud_result`` fell through to the
+    ambiguous ``dq`` branch: the round recorded a miner-fault DQ and the credit
+    was burned, although no box was ever rented and the miner's code never ran
+    (round_000000_1788861194, 2026-09-08: two credits). This re-reads every
+    round's audit with the current rule — a failure with no box is never the
+    miner's — and returns one credit per such commit, once. Idempotent: the
+    refund event names the hotkey, and a commit already made whole (by this
+    or by the round itself) is skipped. Published round files are not
+    rewritten; the ledger event is the record of the correction.
+    """
+    events = getattr(reg, "events", None)
+    refund = getattr(reg, "refund_credit", None)
+    if events is None or refund is None:
+        return 0
+    try:
+        events = list(events)
+    except TypeError:
+        return 0
+    audit_dir = _audit_dir_for(validator)
+    debited: dict[tuple[str, str, str], int] = {}
+    refunded_for: dict[tuple[str, str, str], int] = {}
+    refunds_untagged: dict[tuple[str, str], int] = {}
+    rounds: set[str] = set()
+    for ev in events:
+        if not ev.round_id or ev.coldkey is None:
+            continue
+        if ev.kind == "debit" and ev.hotkey:
+            debited[(ev.round_id, ev.coldkey, ev.hotkey)] =                 debited.get((ev.round_id, ev.coldkey, ev.hotkey), 0) + 1
+            rounds.add(ev.round_id)
+        elif ev.kind == "refund":
+            if ev.hotkey:
+                refunded_for[(ev.round_id, ev.coldkey, ev.hotkey)] =                     refunded_for.get((ev.round_id, ev.coldkey, ev.hotkey), 0) + 1
+            else:
+                refunds_untagged[(ev.round_id, ev.coldkey)] =                     refunds_untagged.get((ev.round_id, ev.coldkey), 0) + 1
+    returned = 0
+    for round_id in sorted(rounds):
+        for coldkey, hotkey, reason in _no_gpu_dqs_in_audit(audit_dir, round_id):
+            key = (round_id, coldkey, hotkey)
+            owed = debited.get(key, 0) - refunded_for.get(key, 0)
+            if owed <= 0:
+                continue
+            spare = refunds_untagged.get((round_id, coldkey), 0)
+            if spare > 0:
+                refunds_untagged[(round_id, coldkey)] = spare - 1
+                continue
+            try:
+                refund(coldkey, round_id,
+                       f"{NO_GPU_RESTITUTION_TAG} {hotkey}: recorded as miner-fault DQ "
+                       f"but no GPU was rented ({reason[:120]}); credit returned",
+                       hotkey=hotkey)
+            except TypeError:
+                refund(coldkey, round_id,
+                       f"{NO_GPU_RESTITUTION_TAG} {hotkey}: recorded as miner-fault DQ "
+                       f"but no GPU was rented ({reason[:120]}); credit returned")
+            except Exception as e:
+                log.error("  could not return no-GPU credit to %s for %s: %s",
+                          coldkey, round_id, e)
+                continue
+            refunded_for[key] = refunded_for.get(key, 0) + 1
+            returned += 1
+            log.warning("  %s: %s was DQ'd for want of a GPU (%s); credit returned to %s",
+                        round_id, hotkey[:12], reason[:60], coldkey[:12])
+    return returned
+
+
+def _refund_abandoned_rounds(validator, reg) -> int:
+    """Return the credits debited in rounds that never published.
+
+    A round is abandoned when the process stopped mid-round (urgent update,
+    crash, operator kill) or the round raised before ``round.published``.
+    Every commit accepted in it was debited one credit, so without this the
+    miner pays for an evaluation that never happened. For each such round:
+    net debits minus refunds already made per coldkey, excluding hotkeys the
+    audit shows were burned by miner fault (gate DQ, unrevealed, eval DQ).
+    Evidence-based: a round whose audit file is missing (audit dir moved or
+    wiped) is left alone rather than guessed at — every round opens its audit
+    file before the first debit, so an abandoned round always has one.
+    Idempotent: refunds are ledger events, so a second start-up finds the
+    net at zero. Runs once, before the first round of a process.
+    """
+    events = getattr(reg, "events", None)
+    refund = getattr(reg, "refund_credit", None)
+    if events is None or refund is None:
+        return 0
+    try:
+        events = list(events)
+    except TypeError:
+        return 0
+    audit_dir = _audit_dir_for(validator)
+    rounds_dir = Path(getattr(validator, "rounds_dir", "") or "")
+    by_round: dict[str, list] = {}
+    for ev in events:
+        if ev.round_id and ev.kind in ("debit", "refund"):
+            by_round.setdefault(ev.round_id, []).append(ev)
+    refunded = 0
+    for round_id, evs in sorted(by_round.items()):
+        if rounds_dir and (rounds_dir / f"{round_id}.json").exists():
+            continue
+        settled, burned = _audit_round_status(audit_dir, round_id)
+        if settled is None or settled:
+            continue
+        net: dict[str, int] = {}
+        hotkeys: dict[str, set[str]] = {}
+        returned_here = 0
+        for ev in evs:
+            if ev.kind == "debit":
+                net[ev.coldkey] = net.get(ev.coldkey, 0) + 1
+                if ev.hotkey:
+                    hotkeys.setdefault(ev.coldkey, set()).add(ev.hotkey)
+            else:
+                net[ev.coldkey] = net.get(ev.coldkey, 0) - 1
+        for coldkey, owed in sorted(net.items()):
+            if owed <= 0 or hotkeys.get(coldkey, set()) & burned:
+                continue
+            for _ in range(owed):
+                try:
+                    refund(coldkey, round_id,
+                           f"round {round_id} abandoned before publication "
+                           f"(restart or crash mid-round): credit returned")
+                    returned_here += 1
+                except Exception as e:
+                    log.error("  could not refund %s for abandoned %s: %s",
+                              coldkey, round_id, e)
+                    break
+        if returned_here:
+            refunded += returned_here
+            log.warning("  round %s never published; returned %d credit(s) debited in it",
+                        round_id, returned_here)
+    return refunded
 
 
 def _sync_payments(reg) -> int:
@@ -912,12 +1339,19 @@ def _start_weight_refresh(validator) -> threading.Event:
     return stop
 
 
-def _sleep_until(ts, clock, sleep) -> None:
+def _sleep_until(ts, clock, sleep, abort=None) -> None:
     """Block (via the injected ``sleep``) until the injected ``clock`` reaches the
     FSM's pause-extended window deadline. Tests pass a fake clock+sleep so a 24h
-    window elapses instantly and deterministically."""
+    window elapses instantly and deterministically.
+
+    ``abort`` (optional, polled every ``_BOUNDARY_POLL_S`` of the wait) raises
+    :class:`RestartNow` when it returns True, so an urgent update does not have
+    to wait out a 3h commit window."""
     if ts is None:
         return
     remaining = ts - clock()
-    if remaining > 0:
-        sleep(remaining)
+    while remaining > 0:
+        if abort is not None and abort():
+            raise RestartNow("immediate restart requested during a window wait")
+        sleep(remaining if abort is None else min(remaining, _BOUNDARY_POLL_S))
+        remaining = ts - clock()

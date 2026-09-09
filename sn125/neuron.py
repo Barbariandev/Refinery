@@ -14,7 +14,7 @@ from typing import ClassVar, Optional
 
 import bittensor as bt
 
-SN125_VERSION = "0.2.0"
+SN125_VERSION = "0.2.3"
 
 from . import settings
 from .references import ADAMW_SOURCE, extract_hparams
@@ -1189,10 +1189,17 @@ class Validator:
         """Publish the current web contract, not the obsolete leaderboard-only feed."""
         try:
             from .dashboard.snapshot import build_snapshot
+            registry = getattr(self, "payment_registry", None)
+            audit_dir = Path(getattr(self, "audit_dir", "") or Path(self.rounds_dir).parent / "audit")
             snapshot = build_snapshot(
                 Path(self.rounds_dir), Path(__file__).resolve().parent / "cloud_status.json",
                 validator_hotkey=latest_bundle.get("validator_hotkey", ""),
                 version=SN125_VERSION,
+                ledger_path=Path(getattr(registry, "store_path", None)
+                                 or audit_dir / "payments" / "ledger.json"),
+                state_path=Path(getattr(self, "state_path", None)
+                                or audit_dir / "validator_state.json"),
+                audit_dir=audit_dir,
             )
             for key, value in (("dashboard.json", snapshot["dashboard"]),
                                ("cloud-status.json", snapshot["cloud"]),

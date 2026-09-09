@@ -64,11 +64,13 @@ class SubStatus(Enum):
     DQ = "dq"
     INFRA_DQ = "infra_dq"
     DEFERRED = "deferred"
+    EXPIRED = "expired"
 
     @property
     def terminal(self) -> bool:
         return self in (SubStatus.UNREVEALED, SubStatus.SCORED,
-                        SubStatus.DQ, SubStatus.INFRA_DQ, SubStatus.DEFERRED)
+                        SubStatus.DQ, SubStatus.INFRA_DQ, SubStatus.DEFERRED,
+                        SubStatus.EXPIRED)
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,8 @@ def commit_hash_of(payload: bytes) -> str:
 
 
 OUTAGE_FLAKE_STREAK = 3
+MAX_UNLAUNCHED_DEFERRALS = 30
+UNLAUNCHED_MAX_AGE_S = 30 * 24 * 3600.0
 
 MAX_EVAL_PER_ROUND = 8
 
@@ -167,7 +171,11 @@ class RoundFSM:
         self._require(Phase.COMMIT_OPEN)
         if commit_hash in self.submissions:
             raise RoundError("duplicate commit hash")
-        coldkey = self.registry.debit_for_commit(hotkey, self.config.round_id)
+        try:
+            coldkey = self.registry.debit_for_commit(hotkey, self.config.round_id,
+                                                     commit_hash=commit_hash)
+        except TypeError:
+            coldkey = self.registry.debit_for_commit(hotkey, self.config.round_id)
         self._accept_seq += 1
         sub = Submission(
             commit_hash=commit_hash,
@@ -298,6 +306,35 @@ class RoundFSM:
         if self._flake_streak >= OUTAGE_FLAKE_STREAK:
             self.pause(f"{self._flake_streak} consecutive provisioning flakes "
                        "= provider outage (§2.4)")
+
+    def defer_unlaunched(self, commit_hash: str, reason: str) -> SubStatus:
+        """The round could not START this evaluation (no B200 inside the launch
+        window, or every rental attempt failed before miner code ran). Not a
+        verdict: the credit stays HELD by the commit and the commit rolls over
+        to the next round as DEFERRED with FIFO priority (``deferrals`` + 1),
+        exactly like a capacity-overflow deferral — continuously, round after
+        round. Only a commit that has already been carried
+        ``MAX_UNLAUNCHED_DEFERRALS`` rounds *and* has waited
+        ``UNLAUNCHED_MAX_AGE_S`` since acceptance is EXPIRED instead: its credit
+        is absorbed. Returns the resulting status."""
+        self._require(Phase.EVALUATING)
+        sub = self._eval_sub(commit_hash, SubStatus.REVEALED, SubStatus.RUNNING)
+        waited_s = max(0.0, self._clock() - float(sub.accepted_at or self._clock()))
+        if (sub.deferrals >= MAX_UNLAUNCHED_DEFERRALS
+                and waited_s >= UNLAUNCHED_MAX_AGE_S):
+            sub.status = SubStatus.EXPIRED
+            sub.selected_for_eval = False
+            sub.forensics.append(
+                f"could not launch ({reason}); carried {sub.deferrals} rounds over "
+                f"{waited_s / 86400:.1f} days without a GPU — expired, credit absorbed")
+            return sub.status
+        sub.status = SubStatus.DEFERRED
+        sub.deferrals += 1
+        sub.selected_for_eval = False
+        sub.forensics.append(
+            f"could not launch ({reason}); credit retained, carried to next round "
+            f"with priority (#{sub.deferrals})")
+        return sub.status
 
     def record_crash(self, commit_hash: str) -> None:
         """Intermittent native crash: relaunch once; second crash on the same

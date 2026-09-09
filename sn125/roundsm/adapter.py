@@ -45,6 +45,9 @@ FLAKE_ERROR_MARKERS: tuple[str, ...] = (
     "box_throughput_floor",
     "box_throughput_ceiling",
     "box_throughput_drift",
+    "capacity_wait",
+    "capacity-aware delay",
+    "b200 capacity",
 )
 
 INFRA_ERROR_MARKERS: tuple[str, ...] = (
@@ -230,6 +233,24 @@ def make_source_gate(
     return gate
 
 
+def no_box_ran(res: dict) -> bool:
+    """True when the cloud layer says it never rented a box for this result
+    (``no_box`` / ``capacity_wait`` stamped by cloud.evaluate_submission when the
+    failure happened before any workload existed). The miner's code never
+    executed, so the failure can only be ours (capacity, provider API, spend
+    admission) — it must never burn a credit."""
+    return bool(res.get("failed")) and bool(res.get("no_box") or res.get("capacity_wait"))
+
+
+def is_no_gpu_failure(reason: str) -> bool:
+    """Does a recorded failure reason describe 'no GPU was ever rented'? Used to
+    re-read historical audit verdicts (live._refund_no_gpu_dqs) with the current
+    classification; keep in step with FLAKE_ERROR_MARKERS' capacity entries."""
+    r = (reason or "").lower()
+    return any(m in r for m in ("capacity_wait", "capacity-aware delay", "b200 capacity",
+                                "rental_provisioning_failed"))
+
+
 def classify_cloud_result(res: dict, *, ambiguous: str = "dq") -> EvalResult:
     """Map a ``cloud.evaluate_submission`` result dict to an ``EvalResult``.
 
@@ -254,7 +275,7 @@ def classify_cloud_result(res: dict, *, ambiguous: str = "dq") -> EvalResult:
             return EvalResult("scored", score=float(score))
         return EvalResult("infra_dq", reason="no parseable score (harness gap)")
 
-    if any(m in err for m in FLAKE_ERROR_MARKERS):
+    if any(m in err for m in FLAKE_ERROR_MARKERS) or no_box_ran(res):
         return EvalResult("flake", reason=res.get("error", "provisioning flake"))
 
     if any(m in err for m in INFRA_ERROR_MARKERS):

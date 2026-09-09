@@ -242,7 +242,10 @@ def main():
         validator.submission_synapse_cls = GetSubmission
         if run_fsm_validator(validator) == 'restart':
             from .roundsm.live import EXIT_RESTART
-            sys.exit(EXIT_RESTART)
+            logging.shutdown()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(EXIT_RESTART)
     elif args.command == 'calibrate':
         import json as _json
         from .cloud import CLOUD_PROVIDERS

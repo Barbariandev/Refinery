@@ -353,8 +353,13 @@ class PaymentRegistry:
             raise UnknownHotkeyError(f"hotkey {hotkey!r} not on metagraph")
         return coldkey
 
-    def debit_for_commit(self, hotkey: str, round_id: str) -> str:
-        """Debit 1 credit from the hotkey's coldkey; returns the coldkey."""
+    def debit_for_commit(self, hotkey: str, round_id: str,
+                         commit_hash: str | None = None) -> str:
+        """Debit 1 credit from the hotkey's coldkey; returns the coldkey. The
+        credit is now HELD by that commit: it is consumed when the commit is
+        evaluated (scored or miner-fault DQ), returned by ``refund_credit`` on
+        an infrastructure fault, and simply stays with the commit when a round
+        cannot evaluate it (overflow or no GPU) and carries it to the next."""
         coldkey = self.coldkey_for_hotkey(hotkey)
         with self._lock:
             if self._balances.get(coldkey, 0) < 1:
@@ -363,19 +368,24 @@ class PaymentRegistry:
 
             def apply() -> None:
                 self._balances[coldkey] -= 1
+                note = "debited at commit acceptance"
+                if commit_hash:
+                    note += f"; held by commit {commit_hash[:12]}"
                 self._append("debit", round_id=round_id, coldkey=coldkey, credits=-1,
-                             hotkey=hotkey, note="debited at commit acceptance")
+                             hotkey=hotkey, note=note)
 
             self._transaction(apply)
         return coldkey
 
-    def refund_credit(self, coldkey: str, round_id: str, note: str) -> None:
-        """Infra-DQ refund: a credit, never TAO (§2.4)."""
+    def refund_credit(self, coldkey: str, round_id: str, note: str,
+                      hotkey: str | None = None) -> None:
+        """Infra-DQ refund: a credit, never TAO (§2.4). ``hotkey`` (optional) names
+        the commit being made whole so a refund can be matched to its debit."""
         with self._lock:
             def apply() -> None:
                 self._balances[coldkey] = self._balances.get(coldkey, 0) + 1
                 self._append("refund", round_id=round_id, coldkey=coldkey, credits=1,
-                             note=note)
+                             hotkey=hotkey, note=note)
 
             self._transaction(apply)
 

@@ -53,6 +53,8 @@ _LIVE_STATUS_BY_EVENT = {
     "gate.passed": "gate_passed",
     "evaluation.run_started": "running",
     "evaluation.flake": "relaunching",
+    "cloud_eval.awaiting_box": "awaiting_gpu",
+    "evaluation.deferred": "deferred",
     "evaluation.finalized": None,
 }
 _LIVE_TERMINAL_EVENTS = ("round.finish", "round.exception", "audit.closed")
@@ -258,6 +260,7 @@ def _live_round(audit_dir: Path | None) -> dict[str, Any] | None:
     round_id = None
     phase = None
     started = None
+    period = None
     last_ts = None
     finished = False
     n = 0
@@ -269,10 +272,12 @@ def _live_round(audit_dir: Path | None) -> dict[str, Any] | None:
         last_ts = rec.get("ts") or last_ts
         if event == "round.start":
             started = rec.get("ts")
+            period = rec.get("round_period_s")
         if event in _LIVE_TERMINAL_EVENTS:
             finished = True
         if event.endswith((".opened", ".closed", ".complete")) or event.startswith(
-                ("round.", "capacity.", "evaluation.attempt", "evaluation.run")):
+                ("round.", "capacity.", "evaluation.attempt", "evaluation.run",
+                 "launch_window.")):
             phase = event
         if event == "payments.credit_snapshot":
             credit_rows = list(rec.get("credit_snapshot") or [])
@@ -292,6 +297,12 @@ def _live_round(audit_dir: Path | None) -> dict[str, Any] | None:
                     "accept_index", "accepted_at", "crashed"):
             if key in rec:
                 row[key] = rec[key]
+        step = {"event": event, "ts": rec.get("ts")}
+        for key in ("provider", "reason", "attempt", "selection_rank", "payload_bytes",
+                    "launch_deadline", "deferrals"):
+            if key in rec:
+                step[key] = rec[key]
+        row.setdefault("timeline", []).append(step)
     if finished:
         return None
     balances = {r.get("commit_hash"): r.get("credit_balance") for r in credit_rows}
@@ -302,6 +313,7 @@ def _live_round(audit_dir: Path | None) -> dict[str, Any] | None:
         "round_id": round_id,
         "audit_file": path.name,
         "started_at": started,
+        "round_period_s": period,
         "last_event_at": last_ts,
         "phase": phase,
         "events": n,

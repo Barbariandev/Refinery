@@ -29,6 +29,7 @@ loop around it (SPEC §6.4), so this module has no R2 / bittensor dependency.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -38,6 +39,8 @@ from .round_fsm import MAX_EVAL_PER_ROUND, Phase, RoundFSM, Submission, SubStatu
 
 DEFAULT_OUTAGE_BACKOFF_S = 600.0
 DEFAULT_MAX_EVAL_ATTEMPTS = 4
+DEFAULT_LAUNCH_WINDOW_S = 4 * 3600.0
+DEFAULT_LAUNCH_RETRY_S = 300.0
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,7 @@ class RoundOutcome:
     selected: list[str] = field(default_factory=list)
     deferred: list[str] = field(default_factory=list)
     pause_reasons: list[str] = field(default_factory=list)
+    unlaunched: list[str] = field(default_factory=list)
 
 
 def _commit_acceptance_key(item: tuple[str, str]) -> tuple[str, str]:
@@ -138,13 +142,33 @@ def _apply_eval(fsm: RoundFSM, commit_hash: str, res: EvalResult,
         raise ValueError(f"unknown EvalResult.outcome: {res.outcome!r}")
 
 
+def _accepts_kw(fn: Callable, name: str) -> bool:
+    """Does ``fn`` take keyword ``name`` (or **kwargs)? Lets the driver pass the
+    launch deadline to hooks that understand it while older two-line lambdas in
+    tests / dry-runs keep working unchanged."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _ensure_b200_capacity(fsm: RoundFSM, check_capacity, await_capacity,
-                          emit: Callable[[str], None], audit=None) -> None:
+                          emit: Callable[[str], None], audit=None, *,
+                          deadline: float | None = None,
+                          clock: Callable[[], float] = time.time) -> bool:
     """B200-only capacity-aware delay (operator directive 2026-06-24). Before
     renting any box, confirm the canonical B200 eval SKU has capacity. If the
     provider has ZERO inventory we DO NOT substitute another GPU class or shrink
     the round — we PAUSE it (§2.4: deadlines stretch, the round never silently
     shrinks) and wait, publishing the delay publicly the whole time, then resume.
+
+    Returns True when capacity is (or became) available. With a ``deadline`` the
+    wait is bounded by the round's launch window: if B200s are still dry when it
+    closes the gate returns False and the caller carries every un-started
+    submission to the next round (credit retained) instead of waiting forever.
 
     This is a pure CAPACITY wait, distinct from a host-802 *flake* (the existing
     consecutive-flake outage sweep in the eval loop): no submission is infra-DQ'd,
@@ -159,22 +183,46 @@ def _ensure_b200_capacity(fsm: RoundFSM, check_capacity, await_capacity,
     is None the gate is a no-op (today's behaviour / local MockChain dry-runs)."""
     if check_capacity is None or await_capacity is None:
         audit_emit(audit, "capacity.check_skipped", reason="capacity hooks unavailable")
-        return
+        return True
     if check_capacity():
         audit_emit(audit, "capacity.available")
-        return
+        return True
+    remaining: float | None = None
+    if deadline is not None:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            audit_emit(audit, "capacity.window_closed", deadline=deadline)
+            emit("B200 still dry and the launch window is closed — un-started "
+                 "submissions carry to the next round (credits retained)")
+            return False
     fsm.pause("awaiting B200 capacity (provider has 0 inventory) — §2.4 capacity delay")
     audit_emit(audit, "capacity.wait_started",
-               reason=fsm.pause_reasons[-1] if fsm.pause_reasons else "")
+               reason=fsm.pause_reasons[-1] if fsm.pause_reasons else "",
+               max_wait_s=remaining)
     emit("⏸ B200 capacity wait — round PAUSED (deadlines stretch; eval budget "
-         "clock counts only training, never this wait)")
+         "clock counts only training, never this wait)"
+         + (f"; up to {remaining/3600:.1f}h" if remaining is not None else ""))
+    restored = True
     try:
-        await_capacity(emit)
+        if remaining is not None and _accepts_kw(await_capacity, "max_wait_s"):
+            await_capacity(emit, max_wait_s=remaining)
+        else:
+            await_capacity(emit)
+    except Exception as e:
+        restored = False
+        audit_emit(audit, "capacity.wait_expired", error=str(e),
+                   error_type=type(e).__name__, max_wait_s=remaining)
+        emit(f"B200 capacity did not return inside the launch window ({e})")
     finally:
         if fsm.phase is Phase.PAUSED:
             fsm.resume()
-            audit_emit(audit, "capacity.wait_finished")
-            emit("▶ B200 capacity restored — round RESUMED")
+            audit_emit(audit, "capacity.wait_finished", restored=restored)
+            emit("▶ B200 capacity restored — round RESUMED" if restored
+                 else "▶ round RESUMED without capacity — carrying un-started work")
+    if restored and not check_capacity():
+        audit_emit(audit, "capacity.recheck_failed_after_wait")
+        return False
+    return restored
 
 
 def drive_round(
@@ -191,6 +239,8 @@ def drive_round(
     clock: Callable[[], float] = time.time,
     outage_backoff_s: float = DEFAULT_OUTAGE_BACKOFF_S,
     max_eval_attempts: int = DEFAULT_MAX_EVAL_ATTEMPTS,
+    launch_window_s: float = DEFAULT_LAUNCH_WINDOW_S,
+    launch_retry_s: float = DEFAULT_LAUNCH_RETRY_S,
     max_eval: int = MAX_EVAL_PER_ROUND,
     check_capacity: Callable[[], bool] | None = None,
     await_capacity: Callable[[Callable[[str], None]], None] | None = None,
@@ -233,9 +283,19 @@ def drive_round(
     $0 (``record_provisioning_flake``). 3 *consecutive* flakes = a provider outage
     and the FSM auto-PAUSES — the driver then waits ``outage_backoff_s`` and
     ``resume()``s, so the round's deadlines stretch by the paused time rather than
-    silently shrinking to whoever happened to provision. A submission still flaking
-    after ``max_eval_attempts`` is conceded as our infra fault (refund) so the round
-    always publishes — the retry loop is bounded, never spins against a dead provider.
+    silently shrinking to whoever happened to provision.
+
+    Launch window: from selection the round has ``launch_window_s`` to START each
+    evaluation. The capacity gate and every relaunch are bounded by that window
+    (``evaluate_batch`` receives ``launch_deadline=`` when it accepts the keyword,
+    so the live batch can poll inventory per submission and pick up sporadic
+    GPUs). Anything still un-started when the window closes — or after
+    ``max_eval_attempts`` flakes — is CARRIED to the next round as DEFERRED with
+    its credit and FIFO priority (``fsm.defer_unlaunched``), round after round;
+    a commit carried ``MAX_UNLAUNCHED_DEFERRALS`` rounds and older than
+    ``UNLAUNCHED_MAX_AGE_S`` expires and its credit is absorbed. No credit is
+    ever burned as miner fault by a failure to obtain a GPU, and the round
+    always publishes.
     """
     emit = on_event or (lambda _m: None)
     if (evaluate is None) == (evaluate_batch is None):
@@ -372,24 +432,51 @@ def drive_round(
             return out
 
     scores: dict[str, float] = {}
+    launch_opened = clock()
+    launch_deadline = launch_opened + max(0.0, float(launch_window_s))
+    batch_takes_deadline = _accepts_kw(evaluate_batch, "launch_deadline")
+    capacity_ok = True
     if selected:
+        audit_emit(audit, "launch_window.opened", opened_at=launch_opened,
+                   deadline=launch_deadline, window_s=launch_window_s,
+                   selected_count=len(selected))
+        emit(f"launch window open for {launch_window_s/3600:.1f}h: "
+             f"{len(selected)} submission(s) start as soon as a B200 is available")
         audit_emit(audit, "capacity.check", selected_count=len(selected))
-        _ensure_b200_capacity(fsm, check_capacity, await_capacity, emit, audit)
-    for commit_hash in selected:
-        fsm.start_run(commit_hash)
-        sub = fsm.submissions[commit_hash]
-        audit_emit(audit, "evaluation.run_started",
-                   hotkey=sub.hotkey, coldkey=sub.coldkey,
-                   commit_hash=commit_hash, selection_rank=sub.selection_rank)
+        capacity_ok = _ensure_b200_capacity(fsm, check_capacity, await_capacity,
+                                            emit, audit, deadline=launch_deadline,
+                                            clock=clock)
     pending = list(selected)
+    if capacity_ok:
+        for commit_hash in selected:
+            fsm.start_run(commit_hash)
+            sub = fsm.submissions[commit_hash]
+            audit_emit(audit, "evaluation.run_started",
+                       hotkey=sub.hotkey, coldkey=sub.coldkey,
+                       commit_hash=commit_hash, selection_rank=sub.selection_rank)
     attempt = 0
-    while pending and attempt < max_eval_attempts:
+    while pending and capacity_ok and attempt < max_eval_attempts:
         attempt += 1
+        if attempt > 1:
+            if clock() >= launch_deadline:
+                break
+            audit_emit(audit, "capacity.recheck", attempt=attempt, pending=list(pending))
+            capacity_ok = _ensure_b200_capacity(fsm, check_capacity, await_capacity,
+                                                emit, audit, deadline=launch_deadline,
+                                                clock=clock)
+            if not capacity_ok:
+                break
         audit_emit(audit, "evaluation.attempt_started",
-                   attempt=attempt, pending=list(pending))
+                   attempt=attempt, pending=list(pending),
+                   launch_deadline=launch_deadline)
         payloads = [(h, fsm.submissions[h].payload) for h in pending]
         try:
-            results_map = evaluate_batch(payloads) if payloads else {}
+            if not payloads:
+                results_map = {}
+            elif batch_takes_deadline:
+                results_map = evaluate_batch(payloads, launch_deadline=launch_deadline)
+            else:
+                results_map = evaluate_batch(payloads)
         except Exception as e:
             audit_emit(audit, "evaluation.batch_exception",
                        attempt=attempt, pending=list(pending),
@@ -416,7 +503,8 @@ def drive_round(
                                outage_backoff_s=outage_backoff_s)
                     emit(f"provider outage (consecutive flakes) — pausing round "
                          f"{outage_backoff_s:.0f}s")
-                    sleep_until(clock() + outage_backoff_s)
+                    sleep_until(min(clock() + outage_backoff_s,
+                                    max(launch_deadline, clock())))
                     fsm.resume()
                     audit_emit(audit, "round.resumed",
                                reason="provider recovered after flake outage")
@@ -432,16 +520,41 @@ def drive_round(
                            score=res.score, reason=res.reason,
                            crashed=looks_like_crash(res.reason))
         pending = retry
+        if pending and launch_retry_s > 0 and clock() < launch_deadline \
+                and fsm.phase is not Phase.PAUSED:
+            sleep_until(min(clock() + launch_retry_s, launch_deadline))
+    unlaunched: list[str] = []
     for commit_hash in pending:
-        emit(f"flake budget exhausted for {commit_hash[:12]} -> infra-DQ refund")
-        fsm.infra_dq(commit_hash, "provider outage persisted past relaunch budget")
+        if not capacity_ok:
+            reason = "no B200 capacity inside the launch window"
+        elif clock() >= launch_deadline:
+            reason = (f"no GPU obtained inside the {launch_window_s/3600:.1f}h launch "
+                      f"window ({attempt} attempt(s))")
+        else:
+            reason = f"relaunch budget exhausted ({attempt} attempt(s)) without a box"
+        status = fsm.defer_unlaunched(commit_hash, reason)
         sub = fsm.submissions[commit_hash]
-        audit_emit(audit, "evaluation.finalized",
-                   hotkey=sub.hotkey, coldkey=sub.coldkey,
-                   commit_hash=commit_hash, outcome="infra_dq",
-                   status=sub.status.value,
-                   reason="provider outage persisted past relaunch budget",
-                   crashed=False)
+        unlaunched.append(commit_hash)
+        if status is SubStatus.DEFERRED:
+            emit(f"{commit_hash[:12]} never launched ({reason}) -> carried to next "
+                 f"round, credit retained (carry #{sub.deferrals})")
+            audit_emit(audit, "evaluation.deferred",
+                       hotkey=sub.hotkey, coldkey=sub.coldkey,
+                       commit_hash=commit_hash, reason=reason,
+                       deferrals=sub.deferrals, credit_retained=True)
+        else:
+            emit(f"{commit_hash[:12]} never launched ({reason}); carried "
+                 f"{sub.deferrals} rounds over 30+ days -> expired, credit absorbed")
+            audit_emit(audit, "evaluation.finalized",
+                       hotkey=sub.hotkey, coldkey=sub.coldkey,
+                       commit_hash=commit_hash, outcome="expired",
+                       status=sub.status.value, reason=reason,
+                       deferrals=sub.deferrals, crashed=False)
+    if selected:
+        audit_emit(audit, "launch_window.closed", opened_at=launch_opened,
+                   deadline=launch_deadline, closed_at=clock(),
+                   launched=len(selected) - len(unlaunched),
+                   unlaunched=list(unlaunched))
 
     report = fsm.publish()
     report["selection_rule"] = (
@@ -450,7 +563,11 @@ def drive_round(
         "accept_index, commit_hash"
     )
     report["selected"] = list(selected)
-    report["deferred"] = list(deferred)
+    report["deferred"] = list(deferred) + [
+        h for h in unlaunched if fsm.submissions[h].status is SubStatus.DEFERRED]
+    report["unlaunched"] = list(unlaunched)
+    report["launch_window"] = {"opened_at": launch_opened, "deadline": launch_deadline,
+                               "window_s": launch_window_s}
     if commit_rejections:
         report["commit_rejections"] = commit_rejections
     audit_emit(audit, "payments.credit_snapshot",
@@ -461,6 +578,7 @@ def drive_round(
         scores=scores,
         carryover=fsm.carryover(),
         selected=selected,
-        deferred=deferred,
+        deferred=list(report["deferred"]),
         pause_reasons=list(fsm.pause_reasons),
+        unlaunched=unlaunched,
     )

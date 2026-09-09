@@ -12,9 +12,14 @@ SNAPSHOT_SCHEMA = "refinery.dashboard-snapshot.v1"
 
 
 def build_snapshot(rounds_dir: Path, cloud_status_path: Path | None, *,
-                   validator_hotkey: str, version: str) -> dict:
+                   validator_hotkey: str, version: str,
+                   ledger_path: Path | None = None, state_path: Path | None = None,
+                   audit_dir: Path | None = None) -> dict:
+    """``ledger_path`` / ``state_path`` / ``audit_dir`` add the payments, queue
+    and live-round sections (see data.build_dashboard_data)."""
     dashboard = build_dashboard_data(
         rounds_dir, cloud_status_path, validator_hotkey=validator_hotkey, version=version,
+        ledger_path=ledger_path, state_path=state_path, audit_dir=audit_dir,
     )
     dashboard["network"]["status"] = "validator-artifacts"
     return {

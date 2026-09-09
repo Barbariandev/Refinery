@@ -446,7 +446,8 @@ class ContinuousPublisher:
             errors = []
             try:
                 write_snapshot(snapshot_dir, build_snapshot(
-                    rounds_dir, cloud_path, validator_hotkey=hotkey, version=SN125_VERSION))
+                    rounds_dir, cloud_path, validator_hotkey=hotkey, version=SN125_VERSION,
+                    ledger_path=ledger_path, state_path=state_path, audit_dir=audit_dir))
             except Exception as exc:
                 errors.append(exc)
             try:

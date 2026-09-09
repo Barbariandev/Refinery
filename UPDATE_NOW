@@ -1,0 +1,13 @@
+Urgent-update marker for validators running `validate --auto-update`.
+
+A push that CHANGES this file is applied immediately instead of at the next
+round boundary: the round in progress is abandoned, credits debited in it are
+returned to the miners on restart, and the validator comes back on the new
+code within one update interval (default 5 minutes). Leaving the file
+unchanged has no effect. Bump the line below to trigger.
+
+See DEPLOYMENT.md, "Urgent updates: skipping the round boundary".
+
+last bump: 2026-09-08 introduce the marker
+last bump: 2026-09-09 0.2.2 no-GPU failures never burn credits; restitution on start
+last bump: 2026-09-09 0.2.3 launch window (sporadic GPUs picked up for 4h; un-started work carried 30 rounds/30 days, never burned)
