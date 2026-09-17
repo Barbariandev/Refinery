@@ -42,6 +42,8 @@ DEFAULT_MAX_EVAL_ATTEMPTS = 4
 DEFAULT_LAUNCH_WINDOW_S = 4 * 3600.0
 DEFAULT_LAUNCH_RETRY_S = 300.0
 
+DEFAULT_REVEAL_RETRY_S = 300.0
+
 
 @dataclass(frozen=True)
 class EvalResult:
@@ -241,6 +243,7 @@ def drive_round(
     max_eval_attempts: int = DEFAULT_MAX_EVAL_ATTEMPTS,
     launch_window_s: float = DEFAULT_LAUNCH_WINDOW_S,
     launch_retry_s: float = DEFAULT_LAUNCH_RETRY_S,
+    reveal_retry_s: float = DEFAULT_REVEAL_RETRY_S,
     max_eval: int = MAX_EVAL_PER_ROUND,
     check_capacity: Callable[[], bool] | None = None,
     await_capacity: Callable[[Callable[[str], None]], None] | None = None,
@@ -348,21 +351,32 @@ def drive_round(
                credit_snapshot=_credit_snapshot(fsm))
 
     audit_emit(audit, "reveal_window.opened", deadline=fsm.deadline())
-    open_hashes = [h for h, s in fsm.submissions.items()
-                   if s.status is SubStatus.COMMITTED]
-    for commit_hash, payload in collect_reveals(open_hashes).items():
-        try:
-            sub = fsm.reveal(commit_hash, payload)
-            audit_emit(audit, "submission.revealed",
-                       hotkey=sub.hotkey, coldkey=sub.coldkey,
-                       commit_hash=commit_hash,
-                       **payload_record(payload, include_source=True))
-        except Exception as e:
-            audit_emit(audit, "submission.reveal_rejected",
-                       commit_hash=commit_hash, reason=str(e),
-                       payload_sha256=hashlib.sha256(payload).hexdigest(),
-                       payload_bytes=len(payload))
-            emit(f"reveal {commit_hash[:12]} rejected: {e}")
+    reveal_pass = 0
+    while True:
+        open_hashes = [h for h, s in fsm.submissions.items()
+                       if s.status is SubStatus.COMMITTED]
+        if not open_hashes:
+            break
+        reveal_pass += 1
+        if reveal_pass > 1:
+            audit_emit(audit, "reveal.retry", attempt=reveal_pass,
+                       open_commit_count=len(open_hashes))
+        for commit_hash, payload in collect_reveals(open_hashes).items():
+            try:
+                sub = fsm.reveal(commit_hash, payload)
+                audit_emit(audit, "submission.revealed",
+                           hotkey=sub.hotkey, coldkey=sub.coldkey,
+                           commit_hash=commit_hash,
+                           **payload_record(payload, include_source=True))
+            except Exception as e:
+                audit_emit(audit, "submission.reveal_rejected",
+                           commit_hash=commit_hash, reason=str(e),
+                           payload_sha256=hashlib.sha256(payload).hexdigest(),
+                           payload_bytes=len(payload))
+                emit(f"reveal {commit_hash[:12]} rejected: {e}")
+        if reveal_retry_s <= 0 or clock() + reveal_retry_s >= fsm.deadline():
+            break
+        sleep_until(clock() + reveal_retry_s)
     sleep_until(fsm.deadline())
     fsm.close_reveals()
     unrevealed = [s for s in fsm.submissions.values()

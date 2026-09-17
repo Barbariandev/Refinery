@@ -68,7 +68,8 @@ from .adapter import (
 )
 from .audit import JsonlAuditLog, audit_emit, looks_like_crash, payload_record
 from .driver import (DEFAULT_LAUNCH_RETRY_S, DEFAULT_LAUNCH_WINDOW_S,
-                     DEFAULT_OUTAGE_BACKOFF_S, EvalResult, drive_round)
+                     DEFAULT_OUTAGE_BACKOFF_S, DEFAULT_REVEAL_RETRY_S,
+                     EvalResult, drive_round)
 from .round_fsm import MAX_EVAL_PER_ROUND, RoundConfig, RoundFSM, SubStatus
 from .state import default_state_path, load_loop_state, save_loop_state
 
@@ -257,6 +258,13 @@ def _launch_retry_s(validator) -> float:
     ``SN125_LAUNCH_RETRY_S``, default 300s)."""
     return max(0.0, _env_or_attr_float(validator, "fsm_launch_retry_s",
                                        "SN125_LAUNCH_RETRY_S", DEFAULT_LAUNCH_RETRY_S))
+
+
+def _reveal_retry_s(validator) -> float:
+    """Reveal re-query cadence across the reveal window (``fsm_reveal_retry_s`` /
+    ``SN125_REVEAL_RETRY_S``, default 300s; 0 = single query at window open)."""
+    return max(0.0, _env_or_attr_float(validator, "fsm_reveal_retry_s",
+                                       "SN125_REVEAL_RETRY_S", DEFAULT_REVEAL_RETRY_S))
 
 
 def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
@@ -719,6 +727,7 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                                                DEFAULT_OUTAGE_BACKOFF_S)),
                 launch_window_s=_launch_window_s(validator),
                 launch_retry_s=_launch_retry_s(validator),
+                reveal_retry_s=_reveal_retry_s(validator),
                 max_eval=round_max_eval,
                 check_capacity=_make_capacity_check(validator),
                 await_capacity=_make_capacity_wait(validator, round_id),
