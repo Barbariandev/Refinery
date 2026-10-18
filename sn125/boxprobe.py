@@ -36,6 +36,7 @@ import time
 
 RESULT_MARKER = "SN125_BOX_PROBE_RESULT"
 
+# Production shape (must match fineweb.make_fineweb_task launch values).
 PROBE_MODEL_CONFIG = "lean-llama-360m"
 PROBE_SEQ_LEN = 2048
 PROBE_BATCH_SIZE = 32
@@ -62,6 +63,9 @@ def run_box_probe(config_name: str = PROBE_MODEL_CONFIG,
     device = torch.device("cuda")
     torch.manual_seed(seed)
 
+    # Mirror the production kernel regime (train_and_eval's header): flash /
+    # mem-efficient SDP on, non-deterministic kernel selection allowed. Flash
+    # is also what keeps the prod shape inside 80 GB without checkpointing.
     torch.use_deterministic_algorithms(False)
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.enable_flash_sdp(True)
@@ -69,9 +73,14 @@ def run_box_probe(config_name: str = PROBE_MODEL_CONFIG,
 
     model = _build_model(config_name, seed, dtype=torch.bfloat16)
     vocab = int(model.config.vocab_size)
+    # Fixed synthetic batch: throughput does not depend on token values, and
+    # reusing the buffer mirrors the loader's steady-state allocation pattern.
     tokens = torch.randint(0, vocab, (batch_size, seq_len), device=device)
 
     params = [p for p in model.parameters() if p.requires_grad]
+    # Reference foreach AdamW with fp32 state — the genesis optimizer's kernel
+    # sequence, including the per-step param staging (detached fp32 clones)
+    # that requires_param_values submissions cost the harness every step.
     m_list = [torch.zeros_like(p, dtype=torch.float32) for p in params]
     v_list = [torch.zeros_like(p, dtype=torch.float32) for p in params]
     beta1, beta2, eps, lr, wd = 0.9, 0.999, 1e-8, 1e-3, 0.01
@@ -81,7 +90,7 @@ def run_box_probe(config_name: str = PROBE_MODEL_CONFIG,
             loss = model(tokens, labels=tokens).loss
         loss.backward()
         grads = [p.grad.float() for p in params]
-        staged = [p.detach().float().clone() for p in params]
+        staged = [p.detach().float().clone() for p in params]  # param staging
         torch._foreach_mul_(m_list, beta1)
         torch._foreach_add_(m_list, grads, alpha=1 - beta1)
         torch._foreach_mul_(v_list, beta2)

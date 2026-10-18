@@ -13,7 +13,7 @@ delete_workload, list_workloads) can drive it, optionally overriding SSH
 addressing (``ssh_base_cmd``) and pricing (``cost_per_hour``). See
 ``cloud_lium.LiumClient`` for the Lium (Bittensor SN51) provider.
 """
-import hashlib, json, logging, os, shlex, stat, subprocess, threading, time
+import hashlib, json, logging, os, re, shlex, stat, subprocess, threading, time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -67,13 +67,42 @@ SSH_KEY_PATH = SSH_KEY_DIR / "targon_id_ed25519"
 SSH_KEY_NAME = "sn125-validator"
 
 MAX_CONCURRENT = 8
-DAILY_SPEND_LIMIT = 1000.0
-RENTAL_STARTUP_TIMEOUT = 300
-SSH_CONNECT_TIMEOUT = 120
-SUBMISSION_MARGIN = 600
+DAILY_SPEND_LIMIT = 1000.0  # USD — operator-approved cap for B200 launch/profiling work.
+RENTAL_STARTUP_TIMEOUT = 300  # 5 min
+SSH_CONNECT_TIMEOUT = 120  # 2 min after RUNNING
+SUBMISSION_MARGIN = 600  # 10 min orchestrator margin (24h job → ~24h10m total rental lifetime)
 
+# Canonical production-eval SKU. The scoring path is B200-ONLY (rule since
+# 2026-06-24): NEVER substitute another GPU class (H200/H100) or another SKU. A
+# different GPU breaks the determinism class AND the fixed-budget (20h) fairness, so
+# when this SKU is dry the validator DELAYS (pauses the round and waits for B200)
+# rather than falling back. See CapacityWait + wait_for_b200_capacity().
 EVAL_SKU = "b200-small"
 DEFAULT_TARGON_IMAGE = "python:3.11-slim-bookworm"
+
+# Workload-name prefix. Every rental this orchestrator creates is named
+# ``<prefix><sha256(round|sub)[:18]>`` and the orphan / staleness sweeps DELETE
+# every workload on the account whose name carries the prefix. All processes
+# sharing one provider account therefore MUST use distinct prefixes: the
+# validator keeps the default, operator tools (scripts/refiner_pod_run.py,
+# calibration drivers) set SN125_WORKLOAD_PREFIX to something unique, or their
+# start-up sweep tears down the live round's boxes (and the validator's sweep
+# theirs). Lowercase alphanumerics and hyphens only; the full name must stay
+# under 32 characters, so keep the prefix at 13 characters or fewer.
+WORKLOAD_PREFIX_ENV = "SN125_WORKLOAD_PREFIX"
+# How many boxes may run the shard download (data_stage) at the same time.
+# Two is the most the Hub's per-account resolver quota sustains for the
+# 976-file production snapshot; see TargonOrchestrator._provision_and_run.
+STAGE_CONCURRENCY_ENV = "SN125_STAGE_CONCURRENCY"
+DEFAULT_STAGE_CONCURRENCY = 2
+DEFAULT_WORKLOAD_PREFIX = "sn125-"
+
+
+def workload_prefix() -> str:
+    raw = os.environ.get(WORKLOAD_PREFIX_ENV, "").strip().lower() or DEFAULT_WORKLOAD_PREFIX
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,12}", raw):
+        raise ValueError(f"{WORKLOAD_PREFIX_ENV}={raw!r}: lowercase alphanumerics/hyphens, 1-13 chars")
+    return raw
 
 
 def is_b200_sku(sku: str) -> bool:
@@ -111,8 +140,34 @@ def make_cloud_client(backend: str, timeout_s: int = 86400):
     return None
 
 
+# Providers allowed to run the SCORING path. Every on-box control (AST
+# sandbox, egress lockdown, clean score worker) is enforced BY the box itself,
+# so the box's host must be at least as trusted as the validator: RunPod
+# Secure Cloud, Targon, Lambda and AWS are provider-operated first-party
+# fleets; Lium is a marketplace of pseudonymous third-party hosts — a miner can
+# BE the host, read competitors' revealed source, sandbag the throughput
+# probe, or forge the reported loss. Lium therefore never scores; it remains
+# available for non-scoring commands (calibrate / box-probe smokes) via
+# make_cloud_client.
+# RunPod (the primary scoring fleet since 2026-09-04) rents CONTAINERS: no
+# CAP_SYS_ADMIN (namespaces/mounts) and no CAP_NET_ADMIN (iptables), probed
+# live on a Secure Cloud pod. Container hosts therefore run the SECCOMP
+# sandbox flavour (sn125/seccomp_sandbox.py: priv drop + syscall filter
+# denying non-UNIX sockets, io_uring, ptrace, mounts; positively probed and
+# nonce-attested) instead of namespaces + iptables — see
+# TargonOrchestrator._provider_isolation / _sandbox_guard. RunPod's
+# COMMUNITY tier is third-party hosted and is refused for scoring
+# (ensure_scoring_providers checks the configured tier).
+# AWS is trusted but OPT-IN (not in settings.DEFAULT_CLOUD_PROVIDER_CHAIN): its
+# only B200 shape is the 8-GPU p6-b200.48xlarge (~$114/h, ~$2.3k per 20h eval),
+# and FailoverClient.cost_per_hour is the pessimistic MAX across the chain, so
+# adding it to a chain raises every rental's reservation against
+# DAILY_SPEND_LIMIT. See cloud_aws.py.
 SCORING_PROVIDERS = ("runpod", "targon", "lambda", "aws")
 
+# Providers whose "box" is a container rather than a VM: the miner sandbox
+# runs in seccomp mode and the box-level egress lockdown is replaced by the
+# per-process syscall filter (proved by the sandbox guard stage).
 CONTAINER_PROVIDERS = ("runpod",)
 
 
@@ -210,17 +265,19 @@ class FailoverClient:
         self.providers = list(providers)
         self._by_name = dict(self.providers)
         self.provider_name = ",".join(name for name, _ in self.providers)
-        self._owner: dict[str, str] = {}
-        self._ssh_keys: dict[str, str] = {}
+        self._owner: dict[str, str] = {}       # wrk_uid -> provider name
+        self._ssh_keys: dict[str, str] = {}    # provider name -> ssh key uid
         self._strikes: dict[str, int] = {}
         self._struck_at: dict[str, float] = {}
         self._lock = threading.Lock()
 
+    # -- ordering / strikes ----------------------------------------------------
     def _is_struck(self, name: str, now: float) -> bool:
         with self._lock:
             if self._strikes.get(name, 0) < self.STRIKE_LIMIT:
                 return False
             if now - self._struck_at.get(name, 0.0) >= self.STRIKE_COOLDOWN_S:
+                # Cooldown elapsed — give the provider a fresh chance.
                 self._strikes[name] = 0
                 return False
             return True
@@ -269,6 +326,7 @@ class FailoverClient:
             return self._by_name[name]
         return None
 
+    # -- duck-typed workload surface --------------------------------------------
     def ensure_ssh_key(self) -> str:
         """Register the validator SSH key with EVERY provider (each needs it
         before its first rental); per-provider uids are kept internally and
@@ -333,13 +391,16 @@ class FailoverClient:
         client = self._client_for(wrk_uid)
         if client is None:
             return False
+        # No timeout forwarded by default: each provider client's own
+        # wait_running default matters (Lambda VMs cold-boot far slower than
+        # Targon containers).
         return client.wait_running(wrk_uid, *args, **kwargs)
 
     def get_workload_state(self, wrk_uid: str) -> dict:
         client = self._client_for(wrk_uid)
         if client is not None:
             return client.get_workload_state(wrk_uid)
-        for _name, c in self.providers:
+        for _name, c in self.providers:  # unknown uid (e.g. restart): first hit wins
             try:
                 state = c.get_workload_state(wrk_uid)
                 if state:
@@ -353,7 +414,7 @@ class FailoverClient:
         if client is not None:
             client.delete_workload(wrk_uid)
             return
-        for name, c in self.providers:
+        for name, c in self.providers:  # unknown uid: best-effort everywhere
             try:
                 c.delete_workload(wrk_uid)
             except Exception as e:
@@ -438,6 +499,14 @@ SKU_COSTS = {
 }
 
 
+def _same_local_day(ts: float) -> bool:
+    """Same calendar day (validator-local, like daily_spend) as now."""
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(float(ts))) == time.strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 @dataclass
 class RentalRecord:
     wrk_uid: str
@@ -448,6 +517,8 @@ class RentalRecord:
     provider: str = ""
     deleted: bool = False
     cost_accrued: float = 0.0
+    # Projected full-lifetime cost, set at admission. Counted against the daily
+    # spend limit while the rental is in flight (actual cost lands at teardown).
     expected_cost: float = 0.0
 
 
@@ -490,6 +561,7 @@ class TargonClient:
                 raise RuntimeError(f"Targon {method} {path}: {e}") from e
         return {}
 
+    # 1. Inventory
     def list_inventory(self, gpu_only: bool = True) -> list[dict]:
         """Get available rental resources. No auth required."""
         qs = "?type=rental" + ("&gpu=true" if gpu_only else "")
@@ -502,6 +574,7 @@ class TargonClient:
                 return item.get("available", 0)
         return 0
 
+    # 2. SSH keys
     def list_ssh_keys(self) -> list[dict]:
         resp = self._req("GET", "/tha/v2/ssh-keys")
         return resp.get("items", []) if isinstance(resp, dict) else resp
@@ -529,6 +602,7 @@ class TargonClient:
         log.info(f"Registered SSH key '{SSH_KEY_NAME}': {uid}")
         return uid
 
+    # 3. Workloads
     def create_workload(self, name: str, resource_name: str, ssh_key_uid: str,
                         image: str = "",
                         envs: list[dict] = None, args: list[str] = None) -> dict:
@@ -540,7 +614,7 @@ class TargonClient:
             "resource_name": resource_name,
             "type": "RENTAL",
             "ssh_keys": [ssh_key_uid],
-            "args": args or ["sleep", "infinity"],
+            "args": args or ["sleep", "infinity"],  # keep container alive
         }
         if envs:
             body["envs"] = envs
@@ -597,11 +671,14 @@ class TargonOrchestrator:
         self.timeout = timeout
         self.project_root = project_root or str(Path(__file__).resolve().parent.parent)
         self.expected_manifest = expected_manifest
+        self.workload_prefix = workload_prefix()
         self._semaphore = threading.Semaphore(MAX_CONCURRENT)
+        self._stage_semaphore = threading.Semaphore(
+            settings.env_int(STAGE_CONCURRENCY_ENV, DEFAULT_STAGE_CONCURRENCY, minimum=1))
         self._ssh_key_uid: str = ""
         self._daily_spend: float = 0.0
         self._daily_spend_date: str = ""
-        self._reserved_spend: float = 0.0
+        self._reserved_spend: float = 0.0  # projected cost of in-flight rentals
         self._spend_lock = threading.Lock()
         self._rentals: list[RentalRecord] = []
         self._capacity_wait: Optional[dict] = None
@@ -812,7 +889,8 @@ class TargonOrchestrator:
         """One-time setup: SSH key registration + orphan cleanup + periodic cleanup thread."""
         self._ssh_key_uid = self.client.ensure_ssh_key()
         self.cleanup_orphans()
-        self.write_status_file()
+        self.write_status_file()  # bootstrap: show '0 active, $0 today' between rentals
+        # Periodic orphan cleanup every 30 min (daemon thread — dies with main process)
         t = threading.Thread(target=self._periodic_cleanup, daemon=True)
         t.start()
         log.info(f"Orchestrator initialized. SSH key: {self._ssh_key_uid}, resource: {self.resource}")
@@ -820,15 +898,16 @@ class TargonOrchestrator:
     def _periodic_cleanup(self):
         """Every 30 min, check for stale rentals (older than timeout+600s) and delete them."""
         while True:
-            time.sleep(1800)
+            time.sleep(1800)  # 30 min
             try:
                 workloads = self.client.list_workloads()
                 for w in workloads:
                     name = w.get("name", "")
-                    if not name.startswith("sn125-"):
+                    if not name.startswith(self.workload_prefix):
                         continue
                     created = w.get("created_at", "")
                     if created:
+                        # ISO 8601 parse — basic check if rental is stale
                         try:
                             from datetime import datetime, timezone
                             ct = datetime.fromisoformat(created.replace("Z", "+00:00"))
@@ -843,13 +922,32 @@ class TargonOrchestrator:
             except Exception as e:
                 log.error(f"Periodic cleanup error: {e}")
 
+    def _mark_rental_deleted(self, wrk_uid: str, rental_start, cost_per_hour: float) -> None:
+        """Close the RentalRecord of a box torn down before the eval ran (never
+        reached RUNNING / create-deploy error). Without this the record stays
+        "active" in cloud_status.json for the life of the process (eight phantom
+        rentals, $6.8k of imaginary spend, on 2026-10-06)."""
+        elapsed = time.time() - rental_start if rental_start else 0.0
+        cost = (elapsed / 3600.0) * cost_per_hour
+        if cost > 0:
+            self._track_cost(cost)
+        for rec in self._rentals:
+            if rec.wrk_uid == wrk_uid and not rec.deleted:
+                rec.deleted = True
+                rec.cost_accrued = cost
+        self.write_status_file()
+
     def cleanup_orphans(self):
-        """DELETE any sn125-* rentals left by a crashed orchestrator (any status)."""
+        """DELETE any ``<prefix>*`` rentals left by a crashed orchestrator (any
+        status). Scoped to this orchestrator's workload prefix: other processes on
+        the same account (a calibration driver, a smoke run) use their own prefix
+        and are never touched — see WORKLOAD_PREFIX_ENV."""
         try:
+            # Check all statuses, not just RUNNING — orphans can be stuck in PROVISIONING etc.
             workloads = self.client.list_workloads()
             for w in workloads:
                 name = w.get("name", "")
-                if name.startswith("sn125-"):
+                if name.startswith(self.workload_prefix):
                     uid = w.get("uid", "")
                     status = w.get("state", {}).get("status", "?")
                     log.warning(f"Cleaning up orphaned rental: {name} ({uid}, {status})")
@@ -860,7 +958,7 @@ class TargonOrchestrator:
     def _check_inventory(self) -> str:
         """Return the canonical B200 eval SKU iff it has capacity; else raise CapacityWait.
 
-        B200-ONLY (operator directive 2026-06-24): the production scoring path NEVER
+        B200-ONLY (rule since 2026-06-24): the production scoring path NEVER
         substitutes another GPU class (H200/H100) or another SKU — that would break
         the determinism class and the fixed-budget (20h) fairness. The old
         cross-SKU/cross-architecture fallback ladder has been removed.
@@ -870,6 +968,7 @@ class TargonOrchestrator:
         ``wait_for_b200_capacity`` rather than scoring on the wrong hardware. A short
         in-call poll absorbs momentary 0-blips so we don't pause for a few seconds.
         """
+        # Hard guard: a non-B200 resource must NEVER reach the scoring path.
         if not is_b200_sku(self.resource):
             raise RuntimeError(
                 f"resource {self.resource!r} is not a B200 SKU — production eval is "
@@ -877,6 +976,7 @@ class TargonOrchestrator:
         avail = self.client.check_availability(self.resource)
         if avail >= 1:
             return self.resource
+        # Short in-call poll (absorb momentary 0-blips before declaring a capacity wait).
         log.warning(f"{self.resource} unavailable (0 slots). Brief re-poll before capacity delay...")
         deadline = time.time() + 60
         while time.time() < deadline:
@@ -904,7 +1004,7 @@ class TargonOrchestrator:
                                on_event=None) -> str:
         """Block until the canonical B200 SKU has capacity, then return it.
 
-        This is the long capacity-aware delay (operator directive 2026-06-24): poll
+        This is the long capacity-aware delay (rule since 2026-06-24): poll
         inventory on a fixed backoff, KEEP WAITING (never substitute, never fail) and
         surface the delay publicly via ``cloud_status.json`` the whole time. If the
         wait exceeds ``alert_after_s`` (default 6h) emit a louder operator alert but
@@ -929,7 +1029,7 @@ class TargonOrchestrator:
                         f"[CAPACITY] B200 ({self.resource}) still dry after "
                         f"{waited/3600:.1f}h — KEEP WAITING (never substitute). "
                         f"Operator: check Targon B200 availability.")
-                    emit(f"⚠️ B200 capacity wait exceeded {alert_after_s/3600:.0f}h "
+                    emit(f"ALERT: B200 capacity wait exceeded {alert_after_s/3600:.0f}h "
                          f"({waited/3600:.1f}h) — still waiting")
                 self.update_capacity_wait(waited_s=waited)
                 if max_wait_s and waited >= max_wait_s:
@@ -938,6 +1038,7 @@ class TargonOrchestrator:
         finally:
             self.clear_capacity_wait()
 
+    # -- capacity-wait public status (dashboard) ------------------------------
     def begin_capacity_wait(self, round_id: str = "") -> None:
         """Mark the orchestrator as DELAYED awaiting B200 capacity + publish it."""
         with self._capacity_lock:
@@ -1120,8 +1221,9 @@ class TargonOrchestrator:
             log.warning(f"[{wrk_uid}] Pre-download partial failure: {r.stderr.decode()[:200]}")
         return result
 
+    # Consecutive poll-failure budget before a detached run is declared lost.
     POLL_INTERVAL_S = 30
-    POLL_FAIL_LIMIT = 30
+    POLL_FAIL_LIMIT = 30  # ~15 min of unreachable box
 
     def _run_sn125_cmd(self, wrk_uid: str, cli_args: str, timeout: int,
                        env: dict = None, audit=None, round_id: str = "",
@@ -1147,6 +1249,12 @@ class TargonOrchestrator:
         exports = "".join(
             f"export {k}={shlex.quote(str(v))}\n" for k, v in (env or {}).items()
             if v is not None and str(v) != "")
+        # The runner script carries the shard-repo read token and must not be
+        # readable by the nobody-uid miner worker on the same box: write it
+        # under umask 077, then restore 022 BEFORE launching the command —
+        # everything the command itself creates (staged shards, logs) must
+        # stay world-readable for the sandboxed worker (regression caught by
+        # the 2026-09-04 RunPod smoke: MANIFEST.json landed 0600).
         launcher = (
             "mkdir -p /workspace/logs\n"
             "( umask 077; cat > " + sh_f + " <<'SN125_RUNNER_EOS'\n"
@@ -1258,7 +1366,7 @@ class TargonOrchestrator:
         bucket = settings.r2_config().get("bucket")
         if not settings.r2_configured():
             for _tid, rec in records:
-                rec.pop("path", None)
+                rec.pop("path", None)  # never publish a box-local path
             log.info("  R2 not configured — skipping checkpoint upload")
             return
         try:
@@ -1270,7 +1378,7 @@ class TargonOrchestrator:
             return
         uploaded = 0
         for tid, rec in records:
-            path = rec.pop("path", None)
+            path = rec.pop("path", None)  # stripped regardless of upload outcome
             if not path:
                 continue
             try:
@@ -1278,39 +1386,115 @@ class TargonOrchestrator:
             except (TypeError, ValueError):
                 pct_tag = 0
             key = f"checkpoints/{round_id}/{sub_uid}/{tid}/q{pct_tag:02d}.safetensors"
-            try:
-                url = s3.generate_presigned_url(
-                    "put_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=900)
-            except Exception as e:
-                audit_emit(audit, "targon.checkpoint.presign_failed", wrk_uid=wrk_uid,
-                           round_id=round_id, sub_uid=sub_uid, key=key, error=str(e))
-                continue
-            want_sha = str(rec.get("sha256", "") or "")
-            sha_check = (f'[ "$(sha256sum {shlex.quote(path)} | cut -d\' \' -f1)" = '
-                         f'{shlex.quote(want_sha)} ] && ') if want_sha else ""
-            cmd = (f"[ ! -L {shlex.quote(path)} ] && [ -f {shlex.quote(path)} ] && "
-                   f"{sha_check}"
-                   f"curl -fsS --connect-timeout 30 --max-time 1800 -T "
-                   f"{shlex.quote(path)} {shlex.quote(url)} >/dev/null "
-                   f"&& echo SN125_CKPT_OK || echo SN125_CKPT_FAIL")
-            try:
-                r = self._ssh_run(wrk_uid, cmd, timeout=1900)
-                out = r.stdout or b""
-                ok = b"SN125_CKPT_OK" in out and b"SN125_CKPT_FAIL" not in out
-            except Exception as e:
-                audit_emit(audit, "targon.checkpoint.upload_failed", wrk_uid=wrk_uid,
-                           round_id=round_id, sub_uid=sub_uid, key=key, error=str(e))
-                continue
-            if ok:
+            if self._put_box_file_to_r2(wrk_uid, s3, bucket, key, path,
+                                        str(rec.get("sha256", "") or ""),
+                                        audit=audit, round_id=round_id, sub_uid=sub_uid):
                 rec["uri"] = f"r2://{bucket}/{key}"
                 uploaded += 1
-            else:
-                audit_emit(audit, "targon.checkpoint.upload_failed", wrk_uid=wrk_uid,
-                           round_id=round_id, sub_uid=sub_uid, key=key,
-                           stderr=(r.stderr or b"")[-500:].decode("utf-8", "replace"))
         audit_emit(audit, "targon.checkpoints.uploaded", wrk_uid=wrk_uid,
                    round_id=round_id, sub_uid=sub_uid, uploaded=uploaded, total=len(records))
         log.info(f"[{wrk_uid}] Uploaded {uploaded}/{len(records)} checkpoints to R2")
+
+    def _put_box_file_to_r2(self, wrk_uid: str, s3, bucket: str, key: str, path: str,
+                            want_sha: str, *, audit=None, round_id: str = "",
+                            sub_uid: str = "", timeout: int = 1900) -> bool:
+        """Upload one file from the (hostile) box straight to R2 through a
+        short-TTL, write-only presigned PUT URL. The URL is the only secret the
+        box sees and it expires in 15 min; a single PUT is fine (<5 GB).
+        Unique markers survive SSH banners. Refuses a symlink (it could point
+        the upload at any root-readable file) and, when ``want_sha`` is given,
+        requires the on-disk sha256 to match it, so what gets published is
+        exactly what was scored/verified. Best-effort: False on any failure."""
+        try:
+            url = s3.generate_presigned_url(
+                "put_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=900)
+        except Exception as e:
+            audit_emit(audit, "targon.checkpoint.presign_failed", wrk_uid=wrk_uid,
+                       round_id=round_id, sub_uid=sub_uid, key=key, error=str(e))
+            return False
+        sha_check = (f'[ "$(sha256sum {shlex.quote(path)} | cut -d\' \' -f1)" = '
+                     f'{shlex.quote(want_sha)} ] && ') if want_sha else ""
+        cmd = (f"[ ! -L {shlex.quote(path)} ] && [ -f {shlex.quote(path)} ] && "
+               f"{sha_check}"
+               f"curl -fsS --connect-timeout 30 --max-time {int(timeout) - 100} -T "
+               f"{shlex.quote(path)} {shlex.quote(url)} >/dev/null "
+               f"&& echo SN125_CKPT_OK || echo SN125_CKPT_FAIL")
+        try:
+            r = self._ssh_run(wrk_uid, cmd, timeout=timeout)
+            out = r.stdout or b""
+            ok = b"SN125_CKPT_OK" in out and b"SN125_CKPT_FAIL" not in out
+        except Exception as e:
+            audit_emit(audit, "targon.checkpoint.upload_failed", wrk_uid=wrk_uid,
+                       round_id=round_id, sub_uid=sub_uid, key=key, error=str(e))
+            return False
+        if not ok:
+            audit_emit(audit, "targon.checkpoint.upload_failed", wrk_uid=wrk_uid,
+                       round_id=round_id, sub_uid=sub_uid, key=key,
+                       stderr=(r.stderr or b"")[-500:].decode("utf-8", "replace"))
+        return ok
+
+    def _upload_refiner_checkpoints(self, wrk_uid: str, round_id: str, sub_uid: str,
+                                    result: dict, checkpoint_dir: str, audit=None) -> None:
+        """Refiner task: publish the SUBMISSION run's q25/q50/q75/final student
+        checkpoints (the §6.3 transparency Challenge 1 has). refiner-eval keeps
+        them in ``checkpoint_dir`` under fixed names and reports each one's
+        sha256 in ``submission.curve.checkpoints``; the box-side upload verifies
+        the sha before the PUT and each record is stamped with its public
+        ``uri``. Best-effort, never raises."""
+        recs = (((result or {}).get("submission") or {}).get("curve") or {}).get("checkpoints") or []
+        recs = [r for r in recs if isinstance(r, dict) and r.get("sha256")]
+        if not recs or not checkpoint_dir:
+            return
+        if not settings.r2_configured():
+            log.info("  R2 not configured — skipping refiner checkpoint upload")
+            return
+        try:
+            s3 = settings.make_r2_client()
+        except Exception as e:
+            log.warning(f"[{wrk_uid}] refiner checkpoint upload skipped (boto3 init failed): {e}")
+            return
+        bucket = settings.r2_config().get("bucket")
+        uploaded = 0
+        for rec in recs:
+            try:
+                pct = float(rec.get("pct", 0.0))
+            except (TypeError, ValueError):
+                continue
+            suffix = "" if pct >= 1.0 else f"_q{int(round(pct * 100)):02d}"
+            path = f"{checkpoint_dir}/submission{suffix}.safetensors"
+            key = f"checkpoints/{round_id}/{sub_uid}/refiner/q{int(round(pct * 100)):02d}.safetensors"
+            if self._put_box_file_to_r2(wrk_uid, s3, bucket, key, path, str(rec["sha256"]),
+                                        audit=audit, round_id=round_id, sub_uid=sub_uid):
+                rec["uri"] = f"r2://{bucket}/{key}"
+                uploaded += 1
+        audit_emit(audit, "targon.checkpoints.uploaded", wrk_uid=wrk_uid,
+                   round_id=round_id, sub_uid=sub_uid, uploaded=uploaded, total=len(recs), task="refiner")
+        log.info(f"[{wrk_uid}] Uploaded {uploaded}/{len(recs)} refiner checkpoints to R2")
+
+    def _archive_refiner_weights(self, wrk_uid: str, box_path: str, sha256: str, nbytes: int) -> str:
+        """Keep a durable copy of a verified miner weight file: the miner's own
+        https URL can die at any time, and a verifier re-running the round
+        needs the exact bytes that were scored. Content-addressed
+        (``refiner_weights/<sha256>.safetensors``), uploaded once; the sha was
+        just verified on the box and is checked again before the PUT. Returns
+        the ``r2://`` URI or '' (best-effort)."""
+        if not settings.r2_configured():
+            return ""
+        try:
+            s3 = settings.make_r2_client()
+            bucket = settings.r2_config().get("bucket")
+            key = f"refiner_weights/{sha256}.safetensors"
+            try:
+                head = s3.head_object(Bucket=bucket, Key=key)
+                if int(head.get("ContentLength", -1)) == int(nbytes):
+                    return f"r2://{bucket}/{key}"
+            except Exception:
+                pass   # not there yet (404) or HEAD not permitted: upload
+            if self._put_box_file_to_r2(wrk_uid, s3, bucket, key, box_path, sha256, timeout=1900):
+                return f"r2://{bucket}/{key}"
+        except Exception as e:
+            log.warning(f"[{wrk_uid}] refiner weights archive skipped: {e}")
+        return ""
 
     def _parse_prod_eval_result(self, stdout: str, rc: int) -> dict:
         """Parse the strict prod-eval JSON line."""
@@ -1348,6 +1532,9 @@ class TargonOrchestrator:
         logged once. Checkpoint uploads from the box never use an HF token —
         they go through short-TTL presigned PUT URLs (_upload_checkpoints)."""
         load_dotenv()
+        # Xet-backed downloads make one api.hf.co token call per file; with
+        # ~1.5k shards and several boxes staging concurrently that trips the
+        # 1000 req/5min account quota. Plain CDN resolve does not.
         env = {"HF_HUB_DISABLE_XET": "1"}
         remote_dir = os.environ.get("SN125_TARGON_FINEWEB_DIR", "").strip()
         if remote_dir:
@@ -1409,6 +1596,7 @@ class TargonOrchestrator:
             raise RuntimeError(parsed.get("error") or f"stage-shards failed rc={rc}")
         return parsed
 
+    # -- C1/C2 boundary: network egress lockdown around miner execution -------
     @staticmethod
     def _net_lockdown_enabled() -> bool:
         """Egress lockdown is ON by default for prod. Operators can disable it for
@@ -1581,9 +1769,72 @@ class TargonOrchestrator:
         audit_emit(audit, "targon.net_restore.done", wrk_uid=wrk_uid,
                    round_id=round_id, sub_uid=sub_uid, ok=ok)
 
+    def _stage_refiner_inputs(self, wrk_uid: str, job: dict) -> dict:
+        """Put a Refiner-task job's inputs on the box (network still on): the
+        suite, the decontamination list (next to the shards, where the entry
+        stream looks for it), the pinned identity baseline, and the miner's
+        weight file. Returns the box paths, plus ``weights_error`` when the
+        weight file could not be fetched or is not the committed one — the one
+        failure here that is the miner's."""
+        root = "/workspace/refiner_job"
+        out: dict = {"suite": f"{root}/suite.json"}
+
+        def put(local: str, remote: str, what: str) -> None:
+            data = Path(local).read_bytes()
+            r = self._ssh_run(wrk_uid, f"mkdir -p {shlex.quote(os.path.dirname(remote))} && "
+                              f"cat > {shlex.quote(remote)} && chmod 644 {shlex.quote(remote)}",
+                              input_data=data, timeout=900)
+            if r.returncode != 0:
+                raise RuntimeError(f"upload of {what} failed: {r.stderr.decode(errors='replace')[-300:]}")
+
+        put(job["suite_path"], out["suite"], "benchmark suite")
+        if job.get("baseline_path"):
+            out["baseline"] = f"{root}/baseline.json"
+            put(job["baseline_path"], out["baseline"], "identity baseline")
+        # The exclusion list lives in the shard directory; ask the box where that is.
+        exports = " ".join(f"export {k}={shlex.quote(str(v))};" for k, v in self._prod_shard_env().items()
+                           if k.startswith("SN125_FINEWEB"))
+        r = self._ssh_run(wrk_uid, f"cd /workspace && {exports} PYTHONPATH=/workspace python -c "
+                          "'from sn125.fineweb import default_data_dir; print(default_data_dir())'", timeout=120)
+        data_dir = r.stdout.decode(errors="replace").strip().splitlines()[-1:] or [""]
+        if r.returncode != 0 or not data_dir[0].startswith("/"):
+            raise RuntimeError(f"could not resolve the shard dir on the box: {r.stderr.decode(errors='replace')[-300:]}")
+        out["data_dir"] = data_dir[0]
+        put(job["decontam_path"], f"{data_dir[0]}/{os.path.basename(job['decontam_path'])}", "decontamination list")
+        if job.get("doc_index_path"):
+            put(job["doc_index_path"], f"{data_dir[0]}/{os.path.basename(job['doc_index_path'])}", "document index")
+
+        w = job.get("weights")
+        if w:
+            dest = f"{root}/weights.safetensors"
+            # https only (also across redirects), size-capped at the committed
+            # size, then size and SHA-256 must equal the commitment.
+            cmd = (f"mkdir -p {root} && rm -f {dest} && "
+                   f"curl -fsSL --proto '=https' --proto-redir '=https' --max-redirs 3 --retry 2 "
+                   f"--connect-timeout 30 --max-time 1800 --max-filesize {int(w['bytes'])} "
+                   f"-o {dest} {shlex.quote(w['url'])} && chmod 644 {dest} && "
+                   f"echo SIZE=$(stat -c %s {dest}) && echo SHA=$(sha256sum {dest} | cut -d' ' -f1)")
+            try:
+                r = self._ssh_run(wrk_uid, cmd, timeout=2000)
+                text = r.stdout.decode(errors="replace")
+                got = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+                if r.returncode != 0:
+                    out["weights_error"] = f"download failed (curl rc={r.returncode})"
+                elif got.get("SIZE") != str(int(w["bytes"])) or got.get("SHA") != w["sha256"]:
+                    out["weights_error"] = (f"file is not the committed one (size {got.get('SIZE')}, "
+                                            f"sha256 {str(got.get('SHA'))[:16]})")
+                else:
+                    out["weights"] = dest
+                    out["weights_archive"] = self._archive_refiner_weights(
+                        wrk_uid, dest, str(w["sha256"]), int(w["bytes"]))
+            except subprocess.TimeoutExpired:
+                out["weights_error"] = "download timed out"
+        return out
+
     def _provision_and_run(self, wrk_uid: str, source: str, round_id: str,
                            sub_uid: str, timeout: int, mode: str = "prod",
-                           audit=None, baseline_bundle: dict | None = None) -> dict:
+                           audit=None, baseline_bundle: dict | None = None,
+                           refiner_job: dict | None = None) -> dict:
         """SSH into rental, provision, run eval, fetch results."""
         stage_timings: dict[str, float] = {}
 
@@ -1601,7 +1852,23 @@ class TargonOrchestrator:
                            elapsed_s=elapsed, error=str(e),
                            error_type=type(e).__name__,
                            crashed=looks_like_crash(str(e)))
-                if pre_eval and not isinstance(e, subprocess.TimeoutExpired):
+                # Every stage before "eval" runs VALIDATOR infrastructure only —
+                # miner code has not executed yet — so a failure here (ssh, setup,
+                # shard staging, egress lockdown, ...) can never be the miner's
+                # fault. Tag it so classify_cloud_result() relaunches the same
+                # submission on a fresh box (a retryable flake) instead of
+                # burning the fee as an ambiguous miner DQ. That includes a
+                # pre-eval SSH command timing out (setup hung for its 600 s,
+                # shard staging for its hour): it is a provisioning failure,
+                # not the 24 h budget timeout — only the eval stage
+                # (pre_eval=False) keeps TimeoutExpired's own type for the
+                # caller's handler. Incident round_000011: a setup hang was
+                # reported as "Submission exceeded timeout+margin".
+                if pre_eval:
+                    if isinstance(e, subprocess.TimeoutExpired):
+                        raise RuntimeError(
+                            f"[pre-eval infra] stage {name} timed out after "
+                            f"{int(getattr(e, 'timeout', 0) or 0)}s") from e
                     raise RuntimeError(
                         f"[pre-eval infra] stage {name} failed: {e}") from e
                 raise
@@ -1634,6 +1901,12 @@ class TargonOrchestrator:
         audit_emit(audit, "targon.fingerprint_post_setup", wrk_uid=wrk_uid,
                    round_id=round_id, sub_uid=sub_uid,
                    fingerprint=post_setup_fingerprint)
+        # Per-box throughput gate (multi-provider fairness): the eval is a fixed
+        # wall-clock budget, so a slow B200 silently starves every schedule a
+        # miner planned against total_steps. Probe the box at the production
+        # shape BEFORE the expensive staging stages; a box under the pinned
+        # floor is rejected as a provisioning flake (fresh box, miner unharmed).
+        # Measure-only until SN125_BOX_PROBE_MIN_STS is pinned — see boxprobe.py.
         box_probe = None
         if mode == "prod" and settings.env_truthy(settings.BOX_PROBE_ENV, default=True):
             box_probe = stage("box_probe",
@@ -1646,15 +1919,37 @@ class TargonOrchestrator:
                             result_field="predownload")
         data_stage = None
         if mode == "prod":
-            data_stage = stage("data_stage",
-                               lambda: self._stage_prod_shards(
-                                   wrk_uid, audit=audit, round_id=round_id, sub_uid=sub_uid),
-                               result_field="data_stage")
+            # At most STAGE_CONCURRENCY boxes download shards at once: each
+            # snapshot_download is ~2k Hub resolver requests against one
+            # account's 5000-per-5-minutes quota, so a third simultaneous box
+            # trips 429 for everyone (rounds 20, 26, 27, 28). Waiting here
+            # costs the box a few idle minutes; the eval clock has not started.
+            def _staged():
+                waited = time.time()
+                with self._stage_semaphore:
+                    audit_emit(audit, "targon.data_stage.slot", wrk_uid=wrk_uid,
+                               round_id=round_id, sub_uid=sub_uid,
+                               waited_s=self._stage_done(waited))
+                    return self._stage_prod_shards(
+                        wrk_uid, audit=audit, round_id=round_id, sub_uid=sub_uid)
+            data_stage = stage("data_stage", _staged, result_field="data_stage")
 
         source_bytes = source.encode()
         stage("submission_upload", lambda: self._ssh_run(
             wrk_uid, "cat > /tmp/sub.py", input_data=source_bytes, timeout=30))
-        if mode == "prod" and baseline_bundle:
+        refiner_stage = None
+        if refiner_job:
+            refiner_stage = stage("refiner_stage",
+                                  lambda: self._stage_refiner_inputs(wrk_uid, refiner_job),
+                                  result_field="refiner_stage")
+            if refiner_stage.get("weights_error"):
+                # Miner code never ran, but the cause is the miner's: the file
+                # behind the committed URL is missing or is not what was committed.
+                return {"failed": True, "score": -1.0, "components": {}, "fault": "miner",
+                        "task_id": refiner_job.get("task_id", ""),
+                        "error": f"refiner weights: {refiner_stage['weights_error']}",
+                        "stage_timings": dict(stage_timings)}
+        if mode == "prod" and baseline_bundle and not refiner_job:
             baseline_bytes = json.dumps(baseline_bundle, default=float).encode()
             stage("baseline_upload", lambda: self._ssh_run(
                 wrk_uid, "cat > /tmp/baseline.json", input_data=baseline_bytes, timeout=30))
@@ -1670,9 +1965,13 @@ class TargonOrchestrator:
         log.info(f"[{wrk_uid}] Running eval (mode={mode}, timeout={timeout}s)...")
         eval_env = None
         worker_log = ""
+        refiner_ckpt_dir = ""
         if mode == "prod":
             _log_id = hashlib.sha256(f"{round_id}|{sub_uid}".encode()).hexdigest()[:18]
             worker_log = f"/workspace/logs/prod_worker_{_log_id}.jsonl"
+            # Own subdirectory: the harness chowns dirname(checkpoint_out) to
+            # the nobody worker, and prod_eval writes --out as root; they must
+            # not share a directory (symlink planting).
             checkpoint_out = f"/workspace/sn125/rounds/ckpt_{_log_id}/prod_checkpoint_{_log_id}.safetensors"
             cli = (
                 "prod-eval /tmp/sub.py "
@@ -1691,12 +1990,62 @@ class TargonOrchestrator:
                 cli += f" --timeout {shlex.quote(prod_eval_timeout)}"
             if self.expected_manifest:
                 cli += f" --expected-manifest {shlex.quote(self.expected_manifest)}"
-            if baseline_bundle:
+            if baseline_bundle and not refiner_job:
                 cli += " --baseline-json /tmp/baseline.json"
+            if refiner_job:
+                # Refiner task (Challenge 2): same box, same staging, same
+                # sandbox and budget knobs; a different evaluator.
+                worker_log = ""
+                checkpoint_out = f"/workspace/sn125/rounds/rf_ckpt_{_log_id}"
+                refiner_ckpt_dir = checkpoint_out
+                cli = (
+                    "refiner-eval /tmp/sub.py "
+                    f"--suite {shlex.quote(refiner_stage['suite'])} "
+                    f"--expected-suite-sha256 {shlex.quote(refiner_job['suite_sha256'])} "
+                    "--decontam require "
+                    f"--expected-decontam-sha256 {shlex.quote(refiner_job['decontam_sha256'])} "
+                    f"--checkpoint-dir {shlex.quote(checkpoint_out)} --keep-checkpoints "
+                    "--out /workspace/sn125/rounds/refiner_eval_result.json"
+                )
+                if refiner_stage.get("weights"):
+                    cli += f" --weights {shlex.quote(refiner_stage['weights'])}"
+                if refiner_stage.get("baseline"):
+                    cli += f" --baseline-json {shlex.quote(refiner_stage['baseline'])}"
+                # Calibration knobs (operator drivers only; a live validator
+                # never sets them): train the identity baseline at another
+                # seed, or only the baseline. Each is recorded by refiner-eval
+                # in the result (task.seed / baseline.source), so a result made
+                # this way cannot be mistaken for a production score.
+                calib_seed = os.environ.get(settings.REFINER_EVAL_SEED_ENV, "").strip()
+                if calib_seed:
+                    cli += f" --seed {int(calib_seed)}"
+                max_reg = os.environ.get(settings.REFINER_HELDOUT_MAX_REGRESSION_ENV, "").strip()
+                if max_reg:
+                    cli += f" --heldout-max-regression {float(max_reg)}"
+                if settings.env_truthy(settings.REFINER_BASELINE_ONLY_ENV, default=False):
+                    cli += " --baseline-only"
+                if prod_eval_steps:
+                    cli += f" --total-steps {shlex.quote(prod_eval_steps)}"
+                if prod_eval_budget:
+                    cli += f" --budget {shlex.quote(prod_eval_budget)}"
+                if prod_eval_timeout:
+                    cli += f" --timeout {shlex.quote(prod_eval_timeout)}"
+                if self.expected_manifest:
+                    cli += f" --expected-manifest {shlex.quote(self.expected_manifest)}"
+            # The canonical launch worker-env is declared in settings.LAUNCH_EVAL_ENV
+            # (optproc on, fail-closed sandbox, inductor forward, CE-tile recompute
+            # off, per-step timeout, progress). settings.launch_eval_env() applies
+            # operator host-env overrides for the supervised-bring-up knobs
+            # (SN125_REQUIRE_SANDBOX=0, SN125_LEAN_COMPILE=0, ...). Merged over the
+            # shard-staging env, which never sets these SN125_* keys.
             eval_env = self._prod_shard_env()
             eval_env.update(settings.launch_eval_env())
-            eval_env.setdefault("SN125_WORKER_LOG_PATH", worker_log)
+            if worker_log:
+                eval_env.setdefault("SN125_WORKER_LOG_PATH", worker_log)
             if self._net_lockdown_enabled():
+                # Egress is cut for the whole eval, so any runtime HF lookup would
+                # hang/fail; force offline so cached tokenizer/config is used. All
+                # models/shards were fetched in the earlier net-on staging stages.
                 eval_env.setdefault("HF_HUB_OFFLINE", "1")
                 eval_env.setdefault("TRANSFORMERS_OFFLINE", "1")
             audit_emit(audit, "targon.prod_eval.env",
@@ -1710,6 +2059,16 @@ class TargonOrchestrator:
                        prod_eval_timeout=prod_eval_timeout)
         else:
             raise ValueError(f"unsupported eval mode {mode!r} (production prod-eval only)")
+        # C1/C2 boundary: cut egress AFTER all net-dependent staging (setup, model
+        # pre-download, shard staging, source/baseline upload) and BEFORE the miner
+        # optimizer executes. Fail-closed — a lockdown failure raises out of stage()
+        # and aborts the eval so miner code never runs on a networked box.
+        # VM hosts: box-level iptables OUTPUT DROP, probed dead. Container hosts
+        # (RunPod pods, no CAP_NET_ADMIN / CAP_SYS_ADMIN): the miner worker runs
+        # under the seccomp sandbox flavour, whose syscall filter denies every
+        # non-UNIX socket for the whole miner process tree; the sandbox guard
+        # stage installs + probes that filter on this exact box first, and the
+        # worker attests it again inside its nonce-authenticated result.
         isolation = self._provider_isolation(wrk_uid)
         if mode == "prod":
             eval_env[settings.SANDBOX_MODE_ENV] = (
@@ -1733,11 +2092,31 @@ class TargonOrchestrator:
             audit=audit, round_id=round_id, sub_uid=sub_uid), pre_eval=False)
         if rc != 0:
             log.error(f"[{wrk_uid}] Eval failed (rc={rc})")
-        result = self._parse_prod_eval_result(stdout, rc)
+        if refiner_job:
+            from .refiner.submission import parse_result_line
+            result = parse_result_line(stdout, rc)
+            if refiner_stage and refiner_stage.get("weights_archive"):
+                result["refiner_weights_archive"] = refiner_stage["weights_archive"]
+            result["refiner_checkpoint_dir"] = refiner_ckpt_dir   # box-local; consumed + dropped at teardown
+            # Operator runs (scripts/refiner_pod_run.py) keep the full result —
+            # per-item bench scores included, which a pinned baseline needs for
+            # paired intervals. Round evals do not ask for it.
+            if refiner_job.get("full_result_path") and not result.get("failed"):
+                try:
+                    r = self._ssh_run(wrk_uid, "cat /workspace/sn125/rounds/refiner_eval_result.json",
+                                      timeout=300)
+                    full = json.loads(r.stdout.decode())
+                    if full.get("score") == result.get("score") and not full.get("failed"):
+                        Path(refiner_job["full_result_path"]).write_text(json.dumps(full, default=str))
+                except Exception as e:
+                    log.warning(f"[{wrk_uid}] could not fetch the full refiner-eval result: {e}")
+        else:
+            result = self._parse_prod_eval_result(stdout, rc)
         result["stage_timings"] = dict(stage_timings)
         result["isolation"] = isolation
         result["sandbox_mode"] = eval_env.get(settings.SANDBOX_MODE_ENV, "")
         if lockdown_info is not None:
+            # Published with the score: how egress was denied on this box.
             result["net_lockdown"] = {k: v for k, v in lockdown_info.items()
                                       if k != "output"}
         result["hardware_fingerprint"] = fingerprint
@@ -1749,6 +2128,10 @@ class TargonOrchestrator:
             result["achieved_steps_per_s"] = achieved
         if worker_log:
             result["worker_log"] = worker_log
+        # Post-eval drift probe (pre-vs-post same-box comparison): quarantine a
+        # finished run whose box changed speed during the eval. pre_eval=False —
+        # miner code HAS run, but the drift marker classifies as a retryable
+        # flake (fresh box, same submission), never a miner DQ.
         if (mode == "prod" and box_probe is not None
                 and not result.get("failed")
                 and settings.env_truthy(settings.BOX_PROBE_DRIFT_ENV, default=True)):
@@ -1883,6 +2266,8 @@ class TargonOrchestrator:
             post = self._run_box_probe(wrk_uid, audit=audit,
                                        round_id=round_id, sub_uid=sub_uid)
         except RuntimeError as e:
+            # Fail-closed: the drift check is a scoring control, and a host
+            # that wants to dodge it could simply break the post-probe.
             self._note_box_rejected(wrk_uid)
             raise RuntimeError(
                 f"box_throughput_drift: post-eval probe failed ({e}) — "
@@ -1936,7 +2321,8 @@ class TargonOrchestrator:
 
     def evaluate_submission(self, source: str, round_id: str, sub_uid: str,
                             mode: str = "prod", audit=None,
-                            baseline_bundle: dict | None = None) -> dict:
+                            baseline_bundle: dict | None = None,
+                            refiner_job: dict | None = None) -> dict:
         """Full per-submission lifecycle: inventory check, create, deploy, SSH, eval, teardown."""
         import os as _os
         _ks = "/root/.sn125/cost_kill_switch"
@@ -1944,6 +2330,9 @@ class TargonOrchestrator:
             audit_emit(audit, "targon.eval.refused", round_id=round_id,
                        sub_uid=sub_uid, reason="cost_kill_switch")
             return {"failed": True, "error": f"[CRITICAL] External cost watchdog kill-switch set ({_ks}). Refusing new rental. Inspect file to see trip reason; remove file only after operator approval and account top-up.", "score": -1.0}
+        # Reserve the projected full-lifetime cost against the daily cap so that
+        # concurrent in-flight rentals (whose real cost only lands at teardown)
+        # cannot all pass the check while completed spend still reads $0.
         expected_cost = ((self.timeout + SUBMISSION_MARGIN) / 3600) * self._cost_per_hour(self.resource)
         if not self._reserve_spend(expected_cost):
             audit_emit(audit, "targon.eval.refused", round_id=round_id,
@@ -1962,6 +2351,7 @@ class TargonOrchestrator:
 
         self._semaphore.acquire()
         try:
+            # 1. Check inventory
             inventory_started = time.time()
             audit_emit(audit, "targon.inventory.check_start",
                        round_id=round_id, sub_uid=sub_uid, resource=self.resource)
@@ -1972,10 +2362,11 @@ class TargonOrchestrator:
                        resource=resource_used, cost_per_hour=cost_per_hour,
                        elapsed_s=self._stage_done(inventory_started))
 
+            # 2. Create + deploy (with 1 retry)
             for attempt in range(2):
                 import hashlib as _hl
                 _digest = _hl.sha256(f"{round_id}|{sub_uid}".encode()).hexdigest()[:18]
-                wl_name = f"sn125-{_digest}"
+                wl_name = f"{self.workload_prefix}{_digest}"  # default 6 + 18 = 24 chars; prefix capped at 13
                 envs = [
                     {"name": "SN125_ROUND_ID", "value": str(round_id)},
                     {"name": "SN125_SUB_UID", "value": str(sub_uid)},
@@ -2020,6 +2411,7 @@ class TargonOrchestrator:
                                    sub_uid=sub_uid, attempt=attempt + 1,
                                    elapsed_s=self._stage_done(attempt_started))
                         break
+                    # Didn't start — delete and retry
                     log.warning(f"[{wrk_uid}] Never reached RUNNING (attempt {attempt+1})")
                     audit_emit(audit, "targon.workload.not_running",
                                wrk_uid=wrk_uid, round_id=round_id,
@@ -2029,6 +2421,7 @@ class TargonOrchestrator:
                         heartbeat_stop.set()
                         heartbeat_stop = None
                     self.client.delete_workload(wrk_uid)
+                    self._mark_rental_deleted(wrk_uid, rental_start, cost_per_hour)
                     wrk_uid = None
                 except Exception as e:
                     log.error(f"Workload create/deploy failed (attempt {attempt+1}): {e}")
@@ -2042,6 +2435,7 @@ class TargonOrchestrator:
                             heartbeat_stop.set()
                             heartbeat_stop = None
                         self.client.delete_workload(wrk_uid)
+                        self._mark_rental_deleted(wrk_uid, rental_start, cost_per_hour)
                         wrk_uid = None
 
             if not wrk_uid:
@@ -2051,9 +2445,11 @@ class TargonOrchestrator:
                           "no_box": True}
                 return result
 
+            # 3. SSH + run
             result = self._provision_and_run(
                 wrk_uid, source, round_id, sub_uid, self.timeout, mode=mode,
-                audit=audit, baseline_bundle=baseline_bundle)
+                audit=audit, baseline_bundle=baseline_bundle,
+                **({"refiner_job": refiner_job} if refiner_job else {}))
             if result.get("failed"):
                 diag = self._capture_failure_diag(wrk_uid)
                 result["remote_diag"] = diag
@@ -2081,6 +2477,10 @@ class TargonOrchestrator:
                       "remote_diag": diag}
             return result
         except CapacityWait as e:
+            # Zero B200 inventory at rental time. No box, no miner code: this is a
+            # capacity outage, never a verdict on the submission. Tag it so the
+            # classifier reads a retryable flake and the driver re-runs its
+            # capacity gate (pause + wait) before the next attempt.
             log.warning(f"[{sub_uid}] capacity wait during rental: {e}")
             audit_emit(audit, "targon.eval.capacity_wait", round_id=round_id,
                        sub_uid=sub_uid, sku=e.sku, waited_s=e.waited_s, error=str(e))
@@ -2097,12 +2497,15 @@ class TargonOrchestrator:
             result = {"failed": True, "error": str(e), "score": -1.0,
                       "remote_diag": diag}
             if not wrk_uid:
+                # Raised before any workload existed (provider API, spend
+                # admission, inventory): the miner's code never ran.
                 result["no_box"] = True
             return result
         finally:
             self._release_reserved_spend(expected_cost)
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
+            # ALWAYS teardown
             if wrk_uid:
                 elapsed = time.time() - (rental_start or time.time())
                 cost = (elapsed / 3600) * cost_per_hour
@@ -2118,7 +2521,12 @@ class TargonOrchestrator:
                         "cost_per_hour": cost_per_hour,
                         "daily_spend_after": self.daily_spend,
                     })
+                    # §6.3 transparency: publish the 4 audit checkpoints to R2 while
+                    # the box is still alive (it is torn down just below). Best-effort.
                     if mode == "prod" and not result.get("failed"):
+                        # Re-open egress now that the miner run has fully finished, so
+                        # the presigned-PUT checkpoint upload can reach R2. Safe: no
+                        # miner code runs after the eval stage returned.
                         if self._net_lockdown_enabled():
                             self._restore_network(wrk_uid, round_id=round_id,
                                                   sub_uid=sub_uid, audit=audit)
@@ -2126,6 +2534,15 @@ class TargonOrchestrator:
                             self._upload_checkpoints(wrk_uid, round_id, sub_uid, result, audit)
                         except Exception as _e:
                             log.warning(f"[{wrk_uid}] checkpoint upload error (non-fatal): {_e}")
+                        rf_dir = result.pop("refiner_checkpoint_dir", "")   # never publish a box path
+                        if rf_dir and refiner_job:
+                            try:
+                                self._upload_refiner_checkpoints(wrk_uid, round_id, sub_uid,
+                                                                 result, rf_dir, audit)
+                            except Exception as _e:
+                                log.warning(f"[{wrk_uid}] refiner checkpoint upload error (non-fatal): {_e}")
+                    else:
+                        result.pop("refiner_checkpoint_dir", None)
                     audit_emit(audit, "targon.result.metadata",
                                wrk_uid=wrk_uid, round_id=round_id,
                                sub_uid=sub_uid, result=result)
@@ -2199,6 +2616,9 @@ class TargonOrchestrator:
             self._wait_ssh(wrk_uid)
             self._upload_project(wrk_uid)
             self._provision(wrk_uid)
+            # Probe uses synthetic data + from-config (random init): HF models only
+            # need the tiny config.json pre-cached before sandboxing. Inline local
+            # models (lean-*/forge-*) have no remote config to fetch.
             if not (model.startswith("lean-") or model.startswith("forge-")):
                 self._ssh_run(wrk_uid, f"cd /workspace && PYTHONPATH=/workspace python -c "
                               f"\"from transformers import AutoConfig; AutoConfig.from_pretrained('{model}', trust_remote_code=True)\"",
@@ -2216,6 +2636,11 @@ class TargonOrchestrator:
             if fp8:
                 cli += " --fp8"
             log.info(f"[{wrk_uid}] Running: sn125 {cli}")
+            # SN125_PROGRESS → wall-clock heartbeat so a long (e.g. 762k-step) run
+            # is never silent; expandable_segments mitigates the CUDA-allocator
+            # fragmentation that accumulates over tens of thousands of steps and is
+            # the prime suspect for the Run-A ~19k-step OOM-style death. Reference
+            # AdamW run is trusted, so the allocator tweak can't taint scoring.
             run_env = {"SN125_PROGRESS": "1",
                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
             if profile:
@@ -2227,6 +2652,8 @@ class TargonOrchestrator:
             stdout, rc = self._run_sn125_cmd(wrk_uid, cli, timeout, env=run_env)
             result = self._parse_calibration_result(stdout, rc)
             if result.get("failed") and wrk_uid:
+                # Capture remote post-mortem BEFORE the finally tears the box down —
+                # distinguishes CUDA OOM vs host OOM-killer (dmesg) vs disk-full.
                 result["remote_diag"] = self._capture_failure_diag(wrk_uid)
                 log.warning(f"[{wrk_uid}] calibrate FAILED — remote_diag:\n{result['remote_diag']}")
             return result
@@ -2349,6 +2776,8 @@ class TargonOrchestrator:
                 cli = (f"calibrate --model {model} --seq {seq} --batch {batch} "
                        f"--steps {steps} --warmup {warmup} --target-hours {target_hours} "
                        f"--empty-cache-every {ece}")
+                # Heartbeat always on (per-step iter rate); the §8 gates + profiler
+                # come from the box env, exactly as calibrate_remote sets them.
                 run_env = {"SN125_PROGRESS": "1", "SN125_PROGRESS_INTERVAL": "20",
                            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
                 if arm.get("profile"):
@@ -2418,7 +2847,7 @@ class TargonOrchestrator:
         """Extract the single 'CALIBRATION_RESULT {json}' line from probe stdout."""
         marker = "CALIBRATION_RESULT "
         for line in reversed(stdout.splitlines()):
-            idx = line.find(marker)
+            idx = line.find(marker)  # tolerate any streaming/log prefix on the line
             if idx != -1:
                 try:
                     d = json.loads(line[idx + len(marker):])
@@ -2469,6 +2898,7 @@ class TargonOrchestrator:
                 "waited_s": waited,
                 "waited_min": round(waited / 60.0, 1),
                 "round_id": cw.get("round_id", ""),
+                # operator alert threshold (6h) so the UI can shout louder past it
                 "alert": waited >= 21600.0,
                 "reason": cw.get("reason", "awaiting_b200_capacity"),
             }
@@ -2489,11 +2919,14 @@ class TargonOrchestrator:
             ],
             "providers": [name for name, _c in getattr(self.client, "providers", [])]
                          or [str(getattr(self.client, "provider_name", "") or "targon")],
-            "total_rentals_today": sum(1 for r in self._rentals if r.deleted),
+            "total_rentals_today": sum(1 for r in self._rentals
+                                       if r.deleted and _same_local_day(r.created_at)),
             "updated": time.time(),
             "resource_sku": self.resource,
             "timeout_h": self.timeout / 3600,
             "cost_per_sub": (self.timeout / 3600) * self._cost_per_hour(self.resource, default=5.0),
+            # Capacity-aware delay (B200-only): None when running normally; a dict
+            # while the round is PAUSED awaiting B200 capacity.
             "capacity_delay": capacity_delay,
         }
 
@@ -2503,9 +2936,11 @@ class TargonOrchestrator:
             p = Path(__file__).resolve().parent / "cloud_status.json"
             p.write_text(json.dumps(self.get_status()))
         except Exception:
-            pass
+            pass  # best-effort, don't crash on dashboard write failure
 
 
+# Versions MUST match requirements.txt and sn125/scripts/setup_b200.sh — keep
+# all three in sync when bumping.
 _DEFAULT_SETUP_SCRIPT = r"""#!/bin/bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive

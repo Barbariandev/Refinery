@@ -3,11 +3,17 @@ import ast, os, sys, time, logging, re as _re
 
 _log = logging.getLogger("sn125.sandbox")
 
+# Sandbox Constants
 
+# `random` is intentionally NOT allowed: the stdlib RNG state is not part of the
+# torch/CUDA RNG snapshot that audit replay (engine/segments.py) restores, so any
+# miner use of it injects non-reproducible nondeterminism (a C5 DQ). Miners that
+# want stochastic updates can still use torch's RNG, which IS snapshotted.
 ALLOWED_IMPORTS = frozenset(["torch", "math", "dataclasses",
                              "collections", "functools", "itertools",
                              "triton", "typing", "enum", "abc"])
 
+# typing is allowed for annotations, but these escape into eval()/frame land.
 _BLOCKED_TYPING_IMPORTS = frozenset(["get_type_hints", "ForwardRef"])
 
 ALLOWED_TRITON_SUBMODULES = frozenset([
@@ -72,6 +78,11 @@ _FORBIDDEN_FRAME_ATTRS = frozenset([
     "inline_asm_elementwise", "extern_elementwise",
     "device_print", "device_assert",
     "module_from_spec", "module_finder",
+    # str.format / str.format_map traverse attributes via a runtime format-spec
+    # string ("{0.__class__}") the AST never sees. The literal-dunder scan below
+    # catches the common case but is evadeable by splitting the dunder across
+    # concatenated literals, so block the call surface itself. (format-spec can
+    # read attributes but not call, so this was low-severity — closed anyway.)
     "format", "format_map",
 ])
 
@@ -80,10 +91,37 @@ class SandboxViolation(Exception):
     pass
 
 
+# Scoring-integrity tripwire: torch global-state tamper detection
+# The harness restricts a miner to returning only an `updates` dict; the model
+# forward, loss, backward, and held-out eval all run in TRUSTED harness code.
+# The one shared mutable surface a miner can still reach is the process-global
+# torch module / class method tables: e.g. `torch.Tensor.item = lambda s: 0.001`
+# (passes the AST: `item` is not a dunder/frame attr, and the assignment target
+# is never inspected) would let a sandboxed optimizer fabricate the very loss the
+# validator scores. Static AST checks cannot catch every alias path
+# (`c = torch.Tensor; c.item = f`, `self.c = torch.Tensor; self.c.item = f`, ...),
+# so the GUARANTEE is a runtime tripwire: snapshot the identity of every public
+# attribute on the objects the harness's eval path depends on, taken before any
+# miner code runs, and re-verify it (a) after the module exec, (b) after optimizer
+# init, and (c) after every step() — before the harness next trusts torch. Any
+# mismatch disqualifies the run and the original objects are restored so the next
+# submission in the same process starts clean.
 
+# Trusted CLASSES: a miner can corrupt a trusted loss read by replacing OR
+# shadowing (adding to the subclass __dict__, overriding an inherited C-method)
+# any method the harness resolves on these via normal attribute lookup —
+# `tensor.item()`, `tensor.float()`, `p.add_(u)`, `loss.backward()`,
+# `model(...)` (Module.__call__/forward). So for classes we track every
+# getattr-stable attribute AND flag names that newly appear.
 _TAMPER_CLASS_NAMES = ("torch.Tensor", "torch.nn.Module", "torch.nn.Linear",
                        "torch.nn.LayerNorm", "torch.nn.Embedding", "torch.nn.Parameter")
 
+# Trusted MODULES: the harness (and the model forward it runs) resolves functions
+# from these. We track changed identity of existing entries (a replaced
+# `F.cross_entropy`, `clip_grad_norm_`, ...); we do NOT flag additions because
+# the top-level torch module legitimately gains lazily-imported attributes during
+# a run. `torch` itself is tracked only over a curated allowlist of functions the
+# harness calls directly, to avoid that lazy-import noise.
 _TAMPER_MODULE_NAMES = ("torch.nn.functional", "torch.nn.utils")
 _TAMPER_TORCH_FUNCS = frozenset({
     "isfinite", "as_tensor", "zeros_like", "no_grad", "inference_mode",
@@ -121,6 +159,13 @@ def _stable_getattr_attrs(obj, names):
 def snapshot_torch_identities() -> dict:
     """Capture the harness-trusted torch surface for tamper detection. Must be
     called while torch is clean (before any miner code runs in this process)."""
+    # torch.compile (dynamo mutation_guard) patches nn.Module.__init__/__setstate__
+    # at the FIRST compiled forward — mid-run, after this snapshot — which the
+    # tamper check would then blame on the miner and disqualify (and "heal",
+    # breaking dynamo's mutation tracking). Install the patch NOW, before the
+    # snapshot, so the compiled-harness state IS the pristine baseline; it is
+    # idempotent and inert when nothing is ever compiled. A miner re-patching
+    # these methods still changes identity vs this baseline and still trips.
     try:
         from torch._dynamo.mutation_guard import install_generation_tagging_init
         install_generation_tagging_init()
@@ -147,6 +192,8 @@ def snapshot_torch_identities() -> dict:
     return snap
 
 
+# Pristine baseline captured at import time, before any submission runs. The
+# validator imports this module at startup, so this is a clean reference.
 _PRISTINE_TORCH = None
 
 
@@ -170,6 +217,11 @@ def check_torch_tamper(restore: bool = True, max_report: int = 12) -> list[str]:
         return []
     bad: list[str] = []
 
+    # Classes: a replaced or shadowed trusted method changes what getattr
+    # resolves vs pristine (inherited C-methods like `item`/`add_` appear in
+    # dir(), so overriding them in the subclass __dict__ is caught here too).
+    # We do NOT flag brand-new names: trusted libraries (transformers/accelerate)
+    # legitimately add helpers like `nn.Module.smart_apply` during model build.
     for cname, attrs in pristine.get("_classes", {}).items():
         try:
             cls = _resolve(cname)
@@ -186,6 +238,8 @@ def check_torch_tamper(restore: bool = True, max_report: int = 12) -> list[str]:
             if restore:
                 try:
                     if name in vars(cls):
+                        # Shadowing entry the subclass didn't have pristinely:
+                        # if `original` came from a base class, drop the shadow.
                         if original is getattr(super(cls, cls), name, _SENTINEL):
                             delattr(cls, name)
                         else:
@@ -193,6 +247,7 @@ def check_torch_tamper(restore: bool = True, max_report: int = 12) -> list[str]:
                 except Exception:
                     pass
 
+    # Modules: changed identity of existing trusted entries.
     for mname, attrs in pristine.get("_modules", {}).items():
         try:
             mod = _resolve(mname)
@@ -338,6 +393,12 @@ def validate_source(source: str, max_bytes: int = 1_048_576, allow_native: bool 
             if isinstance(node, ast.AsyncFunctionDef):
                 violations.append(f"Async functions forbidden: {node.name}")
         elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            # Scoring-integrity (cheap pre-filter for the runtime tripwire):
+            # forbid rebinding an attribute of anything but `self` — e.g.
+            # `torch.Tensor.item = ...`, `F.cross_entropy = ...`, `T.add_ = ...`.
+            # `self.x = ...` (fresh per-instance state) stays allowed; aliasing
+            # through self (`self.c = torch.Tensor; self.c.item = ...`) is caught
+            # at runtime by check_torch_tamper().
             _targets = (node.targets if isinstance(node, (ast.Assign, ast.Delete))
                         else [node.target])
             for _t in _targets:
@@ -469,6 +530,9 @@ def _make_safe_torch():
             setattr(safe, attr, val)
         except Exception:
             pass
+    # Batched tensor-list math used by efficient optimizers. These are private
+    # torch names, so the broad underscore filter above hides them by default;
+    # expose only arithmetic foreach kernels, not allocator/compiler/runtime APIs.
     _FOREACH_ALLOWED = (
         "_foreach_add", "_foreach_add_", "_foreach_sub", "_foreach_sub_",
         "_foreach_mul", "_foreach_mul_", "_foreach_div", "_foreach_div_",
@@ -564,8 +628,10 @@ def _make_safe_triton():
     return safe
 
 
-def load_optimizer_sandboxed(source: str, build_dir: str = "") -> type:
-    """Compile and load Optimizer class from source in restricted namespace."""
+def load_optimizer_sandboxed(source: str, build_dir: str = "",
+                             class_name: str = "Optimizer") -> type:
+    """Compile and load the submission class (``Optimizer`` by default; the
+    Refiner task loads ``Refiner``) from source in the restricted namespace."""
     import hashlib as _hl
     import linecache
     import torch
@@ -693,6 +759,10 @@ def load_optimizer_sandboxed(source: str, build_dir: str = "") -> type:
         namespace["ctypes"] = _safe_ctypes
 
     _src_hash = _hl.sha256(source.encode()).hexdigest()[:16]
+    # hash keeps the path readable/diagnosable per-source; pid+ns make it unique
+    # per load so a re-submission of the same source never reuses a stale file or
+    # races another process writing to the same path (O_EXCL would otherwise skip
+    # the write and leave linecache pointing at the earlier run's contents).
     _tmppath = f"/tmp/_sn125_opt_{_src_hash}_{os.getpid()}_{time.time_ns()}.py"
     if _tmppath not in linecache.cache:
         try:
@@ -704,15 +774,16 @@ def load_optimizer_sandboxed(source: str, build_dir: str = "") -> type:
         except FileExistsError:
             pass
         linecache.cache[_tmppath] = (len(source), None, source.splitlines(True), _tmppath)
-    _ensure_pristine()
+    _ensure_pristine()  # baseline must exist before miner module code runs
     code = compile(source, _tmppath, "exec")
     exec(code, namespace)  # noqa: S102 — intentional sandboxed exec
 
+    # Module-level code may have monkey-patched trusted torch state. Trip + heal.
     _tampered = check_torch_tamper(restore=True)
     if _tampered:
         raise SandboxViolation(
             f"Source tampered with trusted torch global state at import: {_tampered}")
 
-    if "Optimizer" not in namespace:
-        raise SandboxViolation("Source must define a class named 'Optimizer'")
-    return namespace["Optimizer"]
+    if class_name not in namespace:
+        raise SandboxViolation(f"Source must define a class named {class_name!r}")
+    return namespace[class_name]

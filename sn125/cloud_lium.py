@@ -54,8 +54,12 @@ log = logging.getLogger("sn125.cloud_lium")
 LIUM_BASE = "https://lium.io/api"
 LIUM_SSH_KEY_PATH = SSH_KEY_DIR / "lium_id_ed25519"
 
+# Lium pods pull a full docker image on first boot (vs Targon's pre-pulled
+# rental images), so RUNNING can take well beyond Targon's 5-min budget.
 LIUM_STARTUP_TIMEOUT = int(os.environ.get("SN125_LIUM_STARTUP_TIMEOUT", "1500"))
 
+# Canonical SKU → (Lium machine name, GPU count). Keeps the orchestrator's
+# resource string identical across providers (b200-small stays the prod SKU).
 SKU_MACHINE_MAP = {
     "b200-small": ("NVIDIA B200", 1),
     "b200-medium": ("NVIDIA B200", 2),
@@ -65,10 +69,15 @@ SKU_MACHINE_MAP = {
     "h100-small": ("NVIDIA H100 80GB HBM3", 1),
 }
 
+# Pod statuses (OpenAPI PodStatus enum) that mean "will never reach RUNNING".
 _TERMINAL_STATUSES = frozenset({
     "FAILED", "CREATION_FAILED", "BROKEN", "DELETING", "DELETED", "STOPPED",
 })
 
+# Default docker image family used to pick a rent template when the operator
+# has not pinned one via SN125_LIUM_TEMPLATE_ID. The Datura-official PyTorch
+# images keep the container alive with SSH, which is all the harness needs
+# (setup_b200.sh installs its own torch cu128 stack on top).
 DEFAULT_IMAGE_PREFIX = os.environ.get("SN125_LIUM_IMAGE", "daturaai/pytorch")
 
 
@@ -143,7 +152,10 @@ class LiumClient:
         self.termination_hours = termination_hours
         self._pubkey = ""
         self._template_id = ""
+        # pod uid -> ("user@host", port) parsed from the pod's ssh_connect_cmd
         self._ssh_dest: dict[str, tuple[str, int]] = {}
+        # resource -> (price, fetched_at): get_status()/heartbeats ask for the
+        # price constantly; don't turn every status write into an API call.
         self._price_cache: dict[str, tuple[float, float]] = {}
         self._price_ttl_s = 600.0
 
@@ -176,6 +188,7 @@ class LiumClient:
                 raise RuntimeError(f"Lium {method} {path}: {e}") from e
         return {}
 
+    # 1. Inventory
     def list_executors(self, machine_name: str = "") -> list[dict]:
         """List rentable executors, optionally filtered to one machine name."""
         params = {"machine_names": machine_name} if machine_name else None
@@ -228,6 +241,7 @@ class LiumClient:
         self._price_cache[resource_name] = (price, time.time())
         return price
 
+    # 2. SSH keys
     def list_ssh_keys(self) -> list[dict]:
         resp = self._req("GET", "/ssh-keys")
         return resp if isinstance(resp, list) else resp.get("items", [])
@@ -262,6 +276,7 @@ class LiumClient:
         log.info(f"Registered SSH key '{SSH_KEY_NAME}' with Lium: {kid}")
         return kid
 
+    # 3. Templates
     def _resolve_template_id(self) -> str:
         """The docker template a rent request needs. Operators pin one via
         SN125_LIUM_TEMPLATE_ID; otherwise pick the newest official template
@@ -281,12 +296,15 @@ class LiumClient:
             raise RuntimeError(
                 f"no Lium template with image prefix {DEFAULT_IMAGE_PREFIX!r}; "
                 "set SN125_LIUM_TEMPLATE_ID to a template uuid from GET /templates")
+        # Deterministic pick: highest image tag (they sort by version), so all
+        # boxes in a round provision from the same template.
         matches.sort(key=lambda t: str(t.get("docker_image_tag", "")), reverse=True)
         self._template_id = str(matches[0]["id"])
         log.info(f"Using Lium template {self._template_id} "
                  f"({matches[0].get('docker_image')}:{matches[0].get('docker_image_tag')})")
         return self._template_id
 
+    # 4. Pods (the orchestrator's "workloads")
     def create_workload(self, name: str, resource_name: str, ssh_key_uid: str,
                         image: str = "", envs: list[dict] = None,
                         args: list[str] = None) -> dict:
@@ -304,6 +322,7 @@ class LiumClient:
                 f"no rentable Lium executor for {resource_name!r} "
                 f"({machine} x{gpu_count})")
         if not self._pubkey:
+            # ensure_ssh_key normally ran at initialize(); recover if not.
             self.ensure_ssh_key()
         body = {
             "pod_name": name,
@@ -421,6 +440,7 @@ class LiumClient:
             })
         return out
 
+    # 5. SSH addressing (orchestrator hook)
     def _cache_ssh_dest(self, pod_id: str, pod: dict) -> None:
         dest = self._parse_ssh_connect_cmd(pod.get("ssh_connect_cmd", ""))
         if dest:

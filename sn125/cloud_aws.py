@@ -82,48 +82,64 @@ AWS_SSH_KEY_PATH = SSH_KEY_DIR / "aws_id_ed25519"
 AWS_SECURITY_GROUP_NAME = "sn125-validator-ssh"
 MANAGED_TAG = "sn125:managed"
 
+# Operator knobs (env). Names are the cross-process contract; keep stable.
 REGIONS_ENV = "SN125_AWS_REGIONS"
 SSH_CIDR_ENV = "SN125_AWS_SSH_CIDR"
 AMI_SSM_PARAMETER_ENV = "SN125_AWS_AMI_SSM_PARAMETER"
-AMI_ENV = "SN125_AWS_AMI"
+AMI_ENV = "SN125_AWS_AMI"                 # "ami-..." or "us-east-2=ami-...,us-west-2=ami-..."
 ROOT_GIB_ENV = "SN125_AWS_ROOT_GIB"
 STARTUP_TIMEOUT_ENV = "SN125_AWS_STARTUP_TIMEOUT"
 
 DEFAULT_REGIONS = ("us-east-2", "us-west-2", "us-east-1")
 
+# A full OS image cold-boots + cloud-init + NVIDIA driver init: 5-15 min is normal.
 AWS_STARTUP_TIMEOUT = int(os.environ.get(STARTUP_TIMEOUT_ENV, "1500"))
 
+# ── THE STANDARDIZED SPEC ─────────────────────────────────────────────────────
+# Every AWS rental is exactly this. Declared as data so "what box did this
+# score come from" is one auditable record; the resolved AMI id is stamped on
+# the instance tags and returned from create_workload for provenance.
 AWS_STANDARD_SPEC: dict = {
-    "instance_type": "p6-b200.48xlarge",
+    "instance_type": "p6-b200.48xlarge",         # 8× B200 SXM 180GB, 192 vCPU, 2 TiB
+    # AWS Deep Learning Base OSS NVIDIA Driver GPU AMI (Ubuntu 22.04): driver +
+    # CUDA toolkit preinstalled; setup_b200.sh lays the pinned torch cu128 stack
+    # on top exactly as on Targon/Lambda. Resolved per region through the
+    # public SSM parameter so all regions boot the same build.
     "ami_ssm_parameter": ("/aws/service/deeplearning/ami/x86_64/"
                           "base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"),
     "login_user": "ubuntu",
-    "root_volume_gib": 500,
+    "root_volume_gib": 500,                       # shards (~35 GB) + HF cache + quartile ckpts
     "root_volume_type": "gp3",
     "root_iops": 3000,
     "root_throughput_mbps": 500,
     "ebs_optimized": True,
     "tenancy": "default",
-    "market": "on-demand",
-    "imds": "v2-required",
+    "market": "on-demand",                        # never spot: an interruption breaks the fixed budget
+    "imds": "v2-required",                        # HttpTokens=required; no instance profile is attached
     "shutdown_behavior": "terminate",
 }
 
+# Canonical SKU → EC2 instance type. AWS sells B200 only as the 8-GPU node, so
+# every B200 SKU is the same box (the eval uses GPU 0; the rest idle — billed).
+# H100/H200 rows exist for calibration/probe smokes only (never scoring).
 SKU_INSTANCE_MAP = {
     "b200-small": "p6-b200.48xlarge",
     "b200-xlarge": "p6-b200.48xlarge",
     "h100-xlarge": "p5.48xlarge",
     "h200-xlarge": "p5en.48xlarge",
+    # CPU shapes: provisioning-plumbing smokes (key import, SG, boot, root
+    # bootstrap, SSH, tags, teardown) at cents instead of $114/h.
     "cpu-small": "t3.small",
     "cpu-medium": "c7i.xlarge",
 }
 
+# EC2 on-demand vCPU quota codes by instance-family letter (Service Quotas).
 _QUOTA_CODES = {
-    "p": "L-417A185B",
-    "g": "L-DB2E81BA",
+    "p": "L-417A185B",   # Running On-Demand P instances
+    "g": "L-DB2E81BA",   # Running On-Demand G and VT instances
     "vt": "L-DB2E81BA",
 }
-_STANDARD_QUOTA_CODE = "L-1216C47A"
+_STANDARD_QUOTA_CODE = "L-1216C47A"  # Running On-Demand Standard (A, C, D, H, I, M, R, T, Z)
 
 ONDEMAND_USD_FALLBACK = {
     "p6-b200.48xlarge": 113.93,
@@ -133,6 +149,7 @@ ONDEMAND_USD_FALLBACK = {
     "c7i.xlarge": 0.1785,
 }
 
+# EC2 instance states → the Targon-shaped statuses the orchestrator understands.
 _STATUS_MAP = {
     "pending": "PROVISIONING",
     "running": "RUNNING",
@@ -143,12 +160,16 @@ _STATUS_MAP = {
 }
 _TERMINAL_STATUSES = frozenset({"FAILED", "DELETED"})
 
+# RunInstances errors that mean "this AZ can't serve us right now" — fall
+# through to the next AZ/region instead of failing the rental.
 _RETRYABLE_LAUNCH_ERRORS = frozenset({
     "InsufficientInstanceCapacity", "Unsupported", "VcpuLimitExceeded",
     "InstanceLimitExceeded", "InsufficientCapacityOnHost",
     "PendingVerification", "UnsupportedOperation",
 })
 
+# Run as ubuntu (the only login the DLAMI provisions) to make the VM look like a
+# Targon/Lium box: root SSH with our key + a root-owned /workspace.
 _ROOT_BOOTSTRAP = (
     "sudo install -d -m 700 -o root -g root /root/.ssh && "
     "sudo install -m 600 -o root -g root ~/.ssh/authorized_keys "
@@ -258,17 +279,25 @@ class AwsClient:
         self._session = None
         self._factory = client_factory
         self._clients: dict[tuple[str, str], object] = {}
+        # instance id -> region (uids are region-scoped in EC2).
         self._region_of: dict[str, str] = {}
+        # instance id -> public ip, for direct SSH addressing.
         self._ssh_ip: dict[str, str] = {}
+        # region -> imported key-pair name (names may differ per region on collision).
         self._key_names: dict[str, str] = {}
+        # region -> security group id.
         self._sg_ids: dict[str, str] = {}
+        # region -> {"ami": id, "root_device": name, "min_gib": int}
         self._ami_cache: dict[str, dict] = {}
+        # (region, itype) -> (azs, fetched_at); (region, quota_code) -> (value, fetched_at)
         self._offer_cache: dict[tuple[str, str], tuple[list[str], float]] = {}
         self._quota_cache: dict[tuple[str, str], tuple[float, float]] = {}
+        # itype -> (vcpus, fetched_at); itype -> (usd_per_h, fetched_at)
         self._vcpu_cache: dict[str, int] = {}
         self._price_cache: dict[str, tuple[float, float]] = {}
         self._cache_ttl_s = 300.0
 
+    # plumbing
     def _client(self, service: str, region: str):
         key = (service, region)
         if key not in self._clients:
@@ -286,6 +315,7 @@ class AwsClient:
     def _fresh(self, entry, ttl: float | None = None) -> bool:
         return bool(entry) and (time.time() - entry[1]) < (ttl or self._cache_ttl_s)
 
+    # 1. Inventory
     def _vcpus(self, region: str, itype: str) -> int:
         if itype not in self._vcpu_cache:
             resp = self._ec2(region).describe_instance_types(InstanceTypes=[itype])
@@ -402,6 +432,7 @@ class AwsClient:
     def _live_price(self, itype: str) -> float | None:
         import json
         try:
+            # The Price List API is only served from us-east-1 / ap-south-1.
             pricing = self._client("pricing", "us-east-1")
             resp = pricing.get_products(ServiceCode="AmazonEC2", MaxResults=5, Filters=[
                 {"Type": "TERM_MATCH", "Field": "instanceType", "Value": itype},
@@ -424,6 +455,7 @@ class AwsClient:
             log.warning(f"AWS: live price lookup failed for {itype!r}: {e}")
             return None
 
+    # 2. SSH keys + security group
     @staticmethod
     def _key_material(pubkey: str) -> str:
         """type + base64 blob of an OpenSSH public key (comment stripped)."""
@@ -509,6 +541,7 @@ class AwsClient:
         self._sg_ids[region] = sg_id
         return sg_id
 
+    # 3. Image
     def _resolve_ami(self, region: str) -> dict:
         """The standardized image for ``region``: {"ami", "root_device", "min_gib"}.
         SN125_AWS_AMI pins an id; otherwise the spec's public SSM parameter is
@@ -537,6 +570,7 @@ class AwsClient:
         want = int(os.environ.get(ROOT_GIB_ENV, "") or self.spec["root_volume_gib"])
         return max(want, ami_min)
 
+    # 4. Instances (the orchestrator's "workloads")
     def _subnet_for(self, region: str, az: str) -> str:
         subs = self._ec2(region).describe_subnets(Filters=[
             {"Name": "default-for-az", "Values": ["true"]},
@@ -761,6 +795,7 @@ class AwsClient:
                                 "state": {"status": st}, "region": region})
         return out
 
+    # 5. SSH addressing (orchestrator hook)
     def _ssh_cmd_for(self, user_host: str) -> list[str]:
         return ["ssh", "-i", str(self.key_path),
                 "-o", "StrictHostKeyChecking=accept-new",

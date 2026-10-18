@@ -86,6 +86,9 @@ def significance_pareto_adjustment(
     haircut = unproven_haircut if not sig_wins else 1.0
     pareto_dominates = (not sig_losses) and bool(sig_wins)
 
+    # Significance-gated cross-scale: worst rung's defensible improvement
+    # (lcb for wins, ucb for losses, 0 within noise) — diagnostic, mirrors the
+    # point-estimate cross_scale = min(per-task convergence).
     def _gated(t):
         d = per_task[t]
         if d["significant_win"]:
@@ -129,7 +132,7 @@ def score_submission(
     baseline_curves: dict[str, TrainingCurve],
     task_weights: dict[str, float],
     source_bytes: int,
-    max_source_bytes: int = 1_048_576,
+    max_source_bytes: int = 1_048_576,  # standardized to gate.MAX_TOTAL_BYTES
     complexity_lambda: float = 0.002,
     memory_beta: float = 0.01,
 ) -> ScoreRecord:
@@ -179,11 +182,13 @@ def score_submission(
 
         best_hparams[task_id] = (sub_c.lr, sub_c.wd)
 
+        # 1. Convergence — final eval loss improvement
         base_final = base_c.eval_points[-1][1]
         sub_final = sub_c.eval_points[-1][1]
         conv_imp = (base_final - sub_final) / max(abs(base_final), 1e-9)
         conv_imp = max(-2.0, min(1.0, conv_imp))
 
+        # 2. Generalization gap (lower is better)
         sub_gap = _generalization_gap(sub_c.eval_points, sub_c.train_points)
         base_gap = _generalization_gap(base_c.eval_points, base_c.train_points)
         gen_imp = (base_gap - sub_gap) / max(abs(base_gap) + 0.01, 1e-9)
@@ -222,6 +227,9 @@ def score_submission(
     cross = min(task_convs) if task_convs else 0.0
     complexity = complexity_lambda * (source_bytes / max_source_bytes)
 
+    # State-memory penalty: β × log2(sub_state / base_state) — RELATIVE to baseline
+    # Positive = heavier than baseline (penalized), negative = lighter (rewarded)
+    # β=0.01: 2× heavier than baseline costs ~0.01 score (~10-20% of typical good scores)
     _state_mults = [c.state_multiplier for c in submission_curves.values()
                     if not c.failed and c.state_multiplier > 0]
     _base_mults = [c.state_multiplier for c in baseline_curves.values()

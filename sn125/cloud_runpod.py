@@ -86,6 +86,8 @@ DEFAULT_IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
 DEFAULT_DISK_GB = 200
 DEFAULT_MIN_CUDA = "12.8"
 
+# Canonical SKU → (RunPod GPU type id, gpu count). Keeps the orchestrator's
+# resource string identical across providers (b200-small stays the prod SKU).
 SKU_GPU_MAP = {
     "b200-small": ("NVIDIA B200", 1),
     "b200-medium": ("NVIDIA B200", 2),
@@ -97,6 +99,9 @@ SKU_GPU_MAP = {
     "a100-small": ("NVIDIA A100-SXM4-80GB", 1),
 }
 
+# Pod lifecycle statuses (v2 enum) → the Targon-shaped statuses the
+# orchestrator's wait/sweep logic understands. EXITED (stopped) counts as
+# FAILED: a stopped pod cannot serve the eval and must be torn down.
 _STATUS_MAP = {
     "PROVISIONING": "PROVISIONING",
     "STARTING": "PROVISIONING",
@@ -155,6 +160,8 @@ class RunpodClient:
     """Thin HTTP wrapper around the RunPod REST API v2. No SDK dependency."""
 
     provider_name = "runpod"
+    # Pods are containers: the orchestrator runs the seccomp sandbox flavour
+    # and the sandbox-guard stage instead of namespaces + iptables (cloud.py).
     provider_isolation = "container"
 
     def __init__(self, api_key: str = "", base_url: str = RUNPOD_BASE,
@@ -168,10 +175,13 @@ class RunpodClient:
         self.key_path = Path(key_path) if key_path else RUNPOD_SSH_KEY_PATH
         self.image = image or os.environ.get("SN125_RUNPOD_IMAGE", "").strip() or DEFAULT_IMAGE
         self.cloud = (cloud or _cloud_tier()).upper()
+        # pod id -> ("user@host", port) for direct SSH addressing.
         self._ssh_dest: dict[str, tuple[str, int]] = {}
+        # GPU-type catalog cache (availability + pricing are polled constantly).
         self._gpu_cache: dict[str, tuple[dict, float]] = {}
         self._gpu_ttl_s = 60.0
 
+    # 0. HTTP
     def _req(self, method: str, path: str, body: dict = None,
              timeout: int = 30, query: dict = None):
         """Make an HTTP request, return the parsed JSON body ({} for empty)."""
@@ -201,8 +211,11 @@ class RunpodClient:
                     time.sleep(2 ** attempt)
                     continue
                 raise RuntimeError(f"RunPod {method} {path}: {e}") from e
+        # Never fall through to an empty success: an empty key list would make
+        # ensure_ssh_key's full-replace PUT wipe the account's other keys.
         raise RuntimeError(f"RunPod {method} {path}: retries exhausted")
 
+    # 1. Inventory (catalog)
     def get_gpu_type(self, gpu_type_id: str, count: int = 1) -> dict:
         """GET /catalog/gpus/{id} with POD availability for this cloud tier,
         cached ~1 min. Returns {} for an unknown type."""
@@ -260,6 +273,7 @@ class RunpodClient:
             log.warning(f"live price lookup failed for {resource_name!r}: {e}")
         return SKU_COSTS.get(resource_name, 7.0)
 
+    # 2. SSH keys (account-level, full-replace semantics)
     @staticmethod
     def _key_material(pubkey: str) -> str:
         """type + base64 blob of an OpenSSH public key (comment stripped)."""
@@ -291,6 +305,7 @@ class RunpodClient:
         log.info(f"Registered SSH key with RunPod ({len(existing) + 1} key(s) total)")
         return material
 
+    # 3. Pods (the orchestrator's "workloads")
     def create_workload(self, name: str, resource_name: str, ssh_key_uid: str,
                         image: str = "", envs: list[dict] = None,
                         args: list[str] = None) -> dict:
@@ -421,6 +436,7 @@ class RunpodClient:
             })
         return out
 
+    # 4. SSH addressing (orchestrator hook)
     def ssh_base_cmd(self, wrk_uid: str) -> list[str]:
         """Base SSH command for a pod — the direct ``22/tcp`` mapping with the
         locally generated key that ensure_ssh_key registered."""

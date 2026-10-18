@@ -84,6 +84,7 @@ class RoundReport:
                 "checks": [c.__dict__ for c in self.checks]}
 
 
+# ── loading ─────────────────────────────────────────────────────────────────
 
 def load_rounds(rounds_dir: Path) -> list[tuple[Path, dict]]:
     out = []
@@ -110,6 +111,7 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# ── individual checks ───────────────────────────────────────────────────────
 
 def check_hashes(rd: dict, rep: RoundReport) -> None:
     sources = rd.get("sources") or {}
@@ -163,6 +165,9 @@ def check_task_pins(rd: dict, prior: list[dict], rep: RoundReport) -> None:
             if tid in sigs and task_signature(t) != sigs[tid]:
                 drift.append(f"{tid}: signature differs from {p.get('round_id')}")
     manifest = [t.get("data_manifest", "") for t in tasks]
+    # A changed signature is a legitimate task switch (new data manifest, new
+    # budget): it is reported, and the baseline check below enforces that no
+    # curve from the old task can serve as this round's bar.
     rep.add("task.pinned", True,
             (f"task switch: {'; '.join(sorted(set(drift)))}" if drift else
              f"task signature(s) {sigs} stable") + f"; manifest {str(manifest[0])[:16]}")
@@ -192,7 +197,11 @@ def _validator_for(rd: dict, rounds_dir: Path):
                   burn_fraction_floor=None,
                   frontier_confirmation_runs=int(fr.get("confirmation_runs", 1) or 0))
     if "launch_timestamp" in fr:
+        # 0 means "anchor on the first confirmed event" — replay must keep
+        # that even after the operator later sets config.LAUNCH_TIMESTAMP.
         v.launch_timestamp = int(fr.get("launch_timestamp") or 0)
+    # The published floor is authoritative for the replay (it may have been
+    # an explicit operator override at the time).
     if fr.get("burn_fraction_floor") is not None:
         v.burn_fraction_floor = float(fr["burn_fraction_floor"])
         v._burn_floor_explicit = True
@@ -276,6 +285,7 @@ def check_settlement(rd: dict, prior_dir: Path, rep: RoundReport, *, tol: float 
         else:
             confirmations[ch] = {"outcome": rec.get("outcome", "infra_dq"),
                                  "reason": rec.get("reason", "")}
+    # The bar first: recomputed from prior events only.
     events = v._load_frontier_events()
     bar = v._min_improvement_threshold(events, now)
     rec_bar = fr.get("min_improvement_threshold")
@@ -284,6 +294,12 @@ def check_settlement(rd: dict, prior_dir: Path, rep: RoundReport, *, tol: float 
             f"recomputed {bar:.6f} vs recorded {rec_bar}")
     weights = v.compute_weights(results, sources=sources, confirmations=confirmations,
                                 round_id=str(rd.get("round_id", "")), now=now)
+    rf = (rd.get("refiner_task") or {}).get("frontier")
+    if isinstance(rf, dict) and float(rf.get("emission_share", 0.0) or 0.0) > 0.0:
+        # Challenge 2 pays its share from its own pool (replayed by
+        # check_refiner_frontier); the published vector is the blend.
+        from .roundsm.refiner_frontier import blend_weights
+        weights = blend_weights(weights, rf.get("weights") or {}, float(rf["emission_share"]), v.BURN_KEY)
     recorded = rd.get("weights") or {}
     diffs = []
     for hk in set(weights) | set(recorded):
@@ -351,7 +367,141 @@ def _checkpoint_records(rd: dict) -> list[tuple[str, dict]]:
             for r in recs:
                 if isinstance(r, dict):
                     out.append((f"{section}/{key}", r))
+    # Refiner task (Challenge 2): the submission run's quartile checkpoints.
+    for ch, entry in ((rd.get("refiner_task") or {}).get("submissions") or {}).items():
+        for r in (entry or {}).get("checkpoints") or []:
+            if isinstance(r, dict):
+                out.append((f"refiner_task/{ch[:12]}", r))
     return out
+
+
+def check_refiner_task(rd: dict, rep: RoundReport) -> None:
+    """The ``refiner_task`` block (Challenge 2): every entry's envelope is
+    published under its commit hash and hashes to it; the envelope's weight
+    commitment and source hash are what the entry says; the score is
+    suite(submission) - suite(baseline); the entry's signature is recomputed
+    from its own task/suite/decontam/student blocks; the emission share is
+    within [0, 1] and the frontier section agrees with it; the block's
+    suite/decontamination pins match what every entry was scored on."""
+    block = rd.get("refiner_task")
+    if not block:
+        rep.add("refiner.block", True, "no refiner task in this round", skipped=True)
+        return
+    from .refiner.submission import EnvelopeError, parse_envelope
+    from .roundsm.refiner_round import SCHEME, refiner_signature
+    problems = []
+    if block.get("scheme") not in (SCHEME, "refiner-publish-only-v1"):
+        problems.append(f"scheme {block.get('scheme')!r}")
+    share = float(block.get("emission_share", 0.0) or 0.0)
+    if not (0.0 <= share <= 1.0):
+        problems.append(f"emission_share {block.get('emission_share')} outside [0, 1]")
+    frontier = block.get("frontier")
+    if block.get("scheme") == "refiner-publish-only-v1" and share != 0.0:
+        problems.append(f"emission_share {share} on a publish-only record")
+    if isinstance(frontier, dict) and abs(float(frontier.get("emission_share", 0.0) or 0.0) - share) > 1e-12:
+        problems.append(f"frontier pays {frontier.get('emission_share')} but the block says {share}")
+    if share > 0.0 and not isinstance(frontier, dict):
+        problems.append(f"emission_share {share} without a frontier section")
+    sources = rd.get("sources") or {}
+    subs = block.get("submissions") or {}
+    suite_sha = str((block.get("suite") or {}).get("suite_sha256") or "")
+    decontam_sha = str(block.get("decontam_sha256") or "")
+    for ch, e in subs.items():
+        tag = ch[:12]
+        if e.get("commit_hash") != ch:
+            problems.append(f"{tag}: entry keyed under another commit")
+        text = sources.get(ch)
+        if not isinstance(text, str):
+            problems.append(f"{tag}: envelope not published")
+            continue
+        if _sha256_text(text) != ch:
+            problems.append(f"{tag}: envelope does not hash to its commit")
+        try:
+            env = parse_envelope(text)
+        except EnvelopeError as ex:
+            problems.append(f"{tag}: envelope invalid ({ex})")
+            continue
+        if _sha256_text(env["source"]) != e.get("source_sha256"):
+            problems.append(f"{tag}: source_sha256 is not the envelope's source")
+        want_w = ({"sha256": env["weights"]["sha256"], "bytes": env["weights"]["bytes"]} if env["weights"] else None)
+        if (e.get("weights") or None) != want_w:
+            problems.append(f"{tag}: weights commitment differs from the envelope")
+        bench = e.get("bench") or {}
+        if isinstance(bench.get("submission"), (int, float)) and isinstance(bench.get("baseline"), (int, float)) \
+                and isinstance(e.get("score"), (int, float)):
+            if abs(float(e["score"]) - (float(bench["submission"]) - float(bench["baseline"]))) > 1e-6:
+                problems.append(f"{tag}: score != suite(submission) - suite(baseline)")
+        got_suite = str((e.get("suite") or {}).get("suite_sha256") or "")
+        if got_suite and suite_sha and got_suite != suite_sha:
+            problems.append(f"{tag}: scored on suite {got_suite[:12]}, block pins {suite_sha[:12]}")
+        got_dec = str((e.get("entry_stream") or {}).get("exclusions_sha256") or "")
+        if got_dec and decontam_sha and got_dec != decontam_sha:
+            problems.append(f"{tag}: decontamination list {got_dec[:12]} is not the pinned {decontam_sha[:12]}")
+        if "signature" in e and refiner_signature(e) != (e.get("signature") or ""):
+            problems.append(f"{tag}: signature does not recompute from the entry's task/suite/student blocks")
+    sigs = sorted({str(e.get("signature") or "") for e in subs.values()} - {""})
+    if len(sigs) > 1:
+        problems.append(f"{len(sigs)} different task signatures in one round")
+    rep.add("refiner.block", not problems,
+            "; ".join(problems) or f"{len(subs)} refiner entr{'y' if len(subs) == 1 else 'ies'} consistent "
+            f"({'publish-only' if share == 0 else f'pool {share:.0%} of emission'}, "
+            f"signature {sigs[0] if sigs else (block.get('signature') or 'n/a')})")
+
+
+def check_refiner_frontier(rd: dict, prior_dir: Path, rep: RoundReport, *, tol: float = 1e-9) -> None:
+    """Replay the refiner frontier (roundsm/refiner_frontier.settle) from the
+    prior public records, this round's refiner entries and its confirmation
+    runs: the bar, the new event, the pending list, the pool's progress /
+    payable share and its weight map must all reproduce."""
+    block = rd.get("refiner_task")
+    fr = (block or {}).get("frontier") if isinstance(block, dict) else None
+    if not isinstance(fr, dict):
+        rep.add("refiner.frontier", True, "no refiner frontier in this round", skipped=True)
+        return
+    from .roundsm import refiner_frontier as rff
+    now = int(fr.get("timestamp", 0) or rd.get("timestamp", 0) or 0)
+    if abs(now - int(rd.get("timestamp", 0) or 0)) > 600:
+        rep.add("refiner.frontier", False, f"frontier settled at {now}, round recorded at {rd.get('timestamp')}")
+        return
+    cfg = {"signature": fr.get("signature", block.get("signature", "")),
+           "emission_share": float(fr.get("emission_share", 0.0) or 0.0),
+           "baseline_score": fr.get("baseline_score", block.get("baseline_score"))}
+    confirmations = {}
+    for rec in (block.get("confirmations") or {}).values():
+        ch = str(rec.get("commit_hash") or "")
+        if ch:
+            confirmations[ch] = {"outcome": rec.get("outcome", "infra_dq"), "reason": rec.get("reason", ""),
+                                 "result": rec if rec.get("outcome") == "scored" else None}
+    got = rff.settle(cfg, block.get("submissions") or {}, confirmations, rounds_dir=prior_dir,
+                     round_id=str(rd.get("round_id", "")), now=now,
+                     burn_floor=float(fr.get("burn_fraction_floor", 0.0) or 0.0),
+                     launch_timestamp=int(fr.get("launch_timestamp", 0) or 0))
+    problems = []
+    if abs(got["min_improvement_threshold"] - float(fr.get("min_improvement_threshold", -1))) > 1e-12:
+        problems.append(f"bar recomputed {got['min_improvement_threshold']:.6f} vs recorded "
+                        f"{fr.get('min_improvement_threshold')}")
+    ev_a, ev_b = got.get("new_event"), fr.get("new_event")
+    if (ev_a is None) != (ev_b is None) or (ev_a and (
+            ev_a.get("commit_hash") != ev_b.get("commit_hash")
+            or abs(float(ev_a.get("improvement", 0)) - float(ev_b.get("improvement", 0))) > 1e-12)):
+        problems.append(f"new_event recomputed {ev_a and ev_a.get('commit_hash', '')[:12]} vs recorded "
+                        f"{ev_b and ev_b.get('commit_hash', '')[:12]}")
+    pend_a = sorted(p.get("commit_hash", "") for p in got.get("pending_confirmation") or [])
+    pend_b = sorted(p.get("commit_hash", "") for p in fr.get("pending_confirmation") or [])
+    if pend_a != pend_b:
+        problems.append(f"pending recomputed {[p[:12] for p in pend_a]} vs recorded {[p[:12] for p in pend_b]}")
+    for key in ("progress", "payable_share", "burned_share"):
+        if abs(float(got.get(key, 0.0)) - float(fr.get(key, -1.0) or 0.0)) > tol:
+            problems.append(f"{key} recomputed {got.get(key, 0.0):.6f} vs recorded {fr.get(key)}")
+    rec_w = fr.get("weights") or {}
+    for hk in set(got["weights"]) | set(rec_w):
+        if abs(float(got["weights"].get(hk, 0.0)) - float(rec_w.get(hk, 0.0))) > tol:
+            problems.append(f"pool weight {hk[:12]}: recomputed {got['weights'].get(hk, 0.0):.6f} "
+                            f"vs recorded {rec_w.get(hk, 0.0)}")
+    rep.add("refiner.frontier", not problems,
+            "; ".join(problems) or
+            f"bar {got['min_improvement_threshold']:.4f}, new_event={'yes' if ev_b else 'no'}, "
+            f"pending={len(pend_b)}, progress {got['progress']:.4f}, payable {got['payable_share']:.4f} reproduced")
 
 
 def check_checkpoints(rd: dict, rep: RoundReport, *, fetch_base: str = "",
@@ -435,6 +585,7 @@ def check_rescore(rd: dict, rep: RoundReport, *, atol: float, device: str = "cud
             skipped=done == 0 and not problems)
 
 
+# ── driver ──────────────────────────────────────────────────────────────────
 
 def verify_rounds(rounds_dir: Path, only: set[str] | None = None, *,
                   fetch_base: str = "", rescore: bool = False, atol: float = 0.01,
@@ -461,6 +612,11 @@ def verify_rounds(rounds_dir: Path, only: set[str] | None = None, *,
             except Exception as e:  # noqa: BLE001
                 rep.add("settlement.replay", False, f"error: {e}")
             check_attestation(rd, rep)
+            check_refiner_task(rd, rep)
+            try:
+                check_refiner_frontier(rd, prior_dir, rep)
+            except Exception as e:  # noqa: BLE001
+                rep.add("refiner.frontier", False, f"error: {e}")
             check_checkpoints(rd, rep, fetch_base=fetch_base, workdir=tmp / f"blobs{i}")
             if rescore:
                 check_rescore(rd, rep, atol=atol, device=device)

@@ -29,38 +29,75 @@ from __future__ import annotations
 
 import os
 
+# ── env-var NAME registry (the cross-process contract; keep stable) ──────────
+# Fail-closed production guards (env_truthy semantics).
 REQUIRE_SANDBOX_ENV = "SN125_REQUIRE_SANDBOX"
 NET_LOCKDOWN_ENV = "SN125_NET_LOCKDOWN"
 NET_LOCKDOWN_PROBE_ENV = "SN125_NET_LOCKDOWN_PROBE"
 NET_LOCKDOWN_ALLOW_CIDRS_ENV = "SN125_NET_LOCKDOWN_ALLOW_CIDRS"
 USE_OPTPROC_ENV = "SN125_USE_OPTPROC"
+# Refiner task (Challenge 2) in live rounds — see docs/REFINER_TASK.md §9.
+REFINER_TASK_ENV = "SN125_REFINER_TASK"                      # accept + evaluate refiner submissions
+REFINER_EMISSION_SHARE_ENV = "SN125_REFINER_EMISSION_SHARE"  # refiner pool share of emission (default 0.5; 0 = publish-only)
+REFINER_BASELINE_JSON_ENV = "SN125_REFINER_BASELINE_JSON"    # pinned identity-baseline result to reuse
+REFINER_SUITE_ENV = "SN125_REFINER_SUITE"                    # suite JSON shipped to the box (default: <data>/bench/…)
+REFINER_DECONTAM_ENV = "SN125_REFINER_DECONTAM"              # exclusion list shipped to the box (default: next to shards)
+# Calibration knobs for operator drivers (scripts/refiner_calibration.py); a live
+# validator never sets them. Both are recorded in the result by refiner-eval.
+REFINER_EVAL_SEED_ENV = "SN125_REFINER_EVAL_SEED"            # --seed for the box's refiner-eval (default 42)
+REFINER_BASELINE_ONLY_ENV = "SN125_REFINER_BASELINE_ONLY"    # 1 = train/score only the identity baseline
+# Optional held-out non-regression gate (nats; unset = off): a refiner whose student
+# ends worse than the identity baseline on held-out FineWeb-Edu by more than this
+# scores 0 for the round. The suite delta is still published (components.suite_delta).
+REFINER_HELDOUT_MAX_REGRESSION_ENV = "SN125_REFINER_HELDOUT_MAX_REGRESSION"
+# OS sandbox flavour for miner code: "namespaces" (VM hosts — unshare +
+# bind mounts + priv drop; the historical default) or "seccomp" (container
+# hosts such as RunPod pods — priv drop + syscall filter, see
+# sn125/seccomp_sandbox.py). Set per provider by the cloud orchestrator.
 SANDBOX_MODE_ENV = "SN125_SANDBOX_MODE"
 SANDBOX_MODES = ("namespaces", "seccomp")
 OPTPROC_STEP_TIMEOUT_ENV = "SN125_OPTPROC_STEP_TIMEOUT"
 OPTPROC_NO_SNAPSHOT_ENV = "SN125_OPTPROC_NO_SNAPSHOT"
 OPTPROC_UNSYNCED_ENV = "SN125_OPTPROC_UNSYNCED"
 
+# Clean-score (fresh-process rescoring) knobs.
 CLEAN_SCORE_DEVICE_ENV = "SN125_CLEAN_SCORE_DEVICE"
 CLEAN_SCORE_TIMEOUT_ENV = "SN125_CLEAN_SCORE_TIMEOUT"
 CLEAN_SCORE_ATOL_ENV = "SN125_CLEAN_SCORE_ATOL"
 
+# Harness throughput / determinism / diagnostics (env_present semantics unless noted).
 LEAN_COMPILE_ENV = "SN125_LEAN_COMPILE"
 PROGRESS_ENV = "SN125_PROGRESS"
 PROFILE_ENV = "SN125_PROFILE"
 
+# Validator-loop cadence knobs (numeric).
 AUDIT_HEARTBEAT_S_ENV = "SN125_AUDIT_HEARTBEAT_S"
 WEIGHT_REFRESH_S_ENV = "SN125_WEIGHT_REFRESH_S"
 TARGON_HEARTBEAT_S_ENV = "SN125_TARGON_HEARTBEAT_S"
 TARGON_REMOTE_HEARTBEAT_EVERY_ENV = "SN125_TARGON_REMOTE_HEARTBEAT_EVERY"
 
+# Cloud provider failover chain + the per-box compute-standardization gates.
+# The scoring path rents from the FIRST provider in the chain with B200
+# inventory and fails over down the chain; the round PAUSES only when every
+# provider is dry. Lium (a marketplace of untrusted third-party hosts) is
+# refused for scoring — see cloud.ensure_scoring_providers().
 CLOUD_PROVIDERS_ENV = "SN125_CLOUD_PROVIDERS"
-CLOUD_PROVIDER_ENV = "SN125_CLOUD_PROVIDER"
+CLOUD_PROVIDER_ENV = "SN125_CLOUD_PROVIDER"   # legacy single-provider knob
 BOX_PROBE_ENV = "SN125_BOX_PROBE"
 BOX_PROBE_MIN_STS_ENV = "SN125_BOX_PROBE_MIN_STS"
+# Two-sided throughput band (multi-provider fairness): a box outside
+# ref*(1 ± band/100) is rejected as a provisioning flake, both too SLOW (the
+# miner's schedule is starved) and too FAST (a lucky box would inflate the
+# score and poison the frontier ratchet). Pin the reference with the box-probe
+# procedure in boxprobe.py; unset = band gate off (legacy MIN_STS floor only).
 BOX_PROBE_REF_STS_ENV = "SN125_BOX_PROBE_REF_STS"
 BOX_PROBE_BAND_PCT_ENV = "SN125_BOX_PROBE_BAND_PCT"
+# Post-eval drift probe: re-run the box probe after a successful eval and
+# quarantine the run when the box's own speed moved more than the band vs the
+# pre-eval probe (mid-run throttling / noisy neighbor / probe sandbagging).
 BOX_PROBE_DRIFT_ENV = "SN125_BOX_PROBE_DRIFT"
 
+# Infra credentials (secrets; read-only here).
 R2_ENDPOINT_ENV = "R2_ENDPOINT"
 R2_ACCESS_KEY_ENV = "R2_ACCESS_KEY"
 R2_SECRET_KEY_ENV = "R2_SECRET_KEY"
@@ -74,16 +111,28 @@ DEFAULT_CLOUD_PROVIDER_CHAIN = ("runpod",)
 DEFAULT_BOX_PROBE_BAND_PCT = 5.0
 
 
+# ── LAUNCH PROFILE ────────────────────────────────────────────────────────────
+# The canonical production configuration the validator injects into every worker
+# at launch. Declared here as data (not scattered string literals in cloud.py) so
+# "what are we launching with" is auditable in one place.
+# These are the CROSS-BOX EVAL knobs only. The other halves of the launch config
+# live where they are computed and must not be duplicated here:
+#   * schedule horizon / token budget  → fineweb.PROD_CONFIRM_STEPS (188k)
+#   * burn schedule / frontier thresholds / public seeds → config.py
+#   * egress lockdown default          → net_lockdown_enabled() (ON unless off)
 LAUNCH_EVAL_ENV: dict[str, str] = {
-    USE_OPTPROC_ENV: "1",
-    REQUIRE_SANDBOX_ENV: "1",
-    "SN125_LEAN_COMPILE": "1",
-    "SN125_LEAN_LOSS_CKPT": "0",
-    OPTPROC_STEP_TIMEOUT_ENV: "30",
-    PROGRESS_ENV: "1",
+    USE_OPTPROC_ENV: "1",              # route miner steps through CUDA-IPC isolation
+    REQUIRE_SANDBOX_ENV: "1",          # fail-closed OS sandbox (namespaces or seccomp + priv drop)
+    "SN125_LEAN_COMPILE": "1",         # inductor-compiled forward (~2x B200 throughput)
+    "SN125_LEAN_LOSS_CKPT": "0",       # CE-tile recompute off (measured 2026-07-03)
+    OPTPROC_STEP_TIMEOUT_ENV: "30",    # per-step wall cap seconds (kill runaway miner step)
+    PROGRESS_ENV: "1",                 # emit worker progress heartbeats
     "SN125_FORWARD_WORKER_PROGRESS": "1",
 }
 
+# Launch knobs an operator MAY override from host env for a supervised bring-up
+# (e.g. SN125_REQUIRE_SANDBOX=0 on a box without unshare, or SN125_LEAN_COMPILE=0
+# to fall back to the eager forward). Everything else in LAUNCH_EVAL_ENV is fixed.
 LAUNCH_OPERATOR_OVERRIDABLE = frozenset({
     "SN125_LEAN_COMPILE", "SN125_LEAN_LOSS_CKPT", "SN125_LEAN_LOSS_CHUNKS",
     REQUIRE_SANDBOX_ENV,
@@ -106,6 +155,7 @@ def launch_eval_env(host_env: dict | None = None) -> dict[str, str]:
     return env
 
 
+# ── parse helpers ────────────────────────────────────────────────────────────
 
 def env_truthy(name: str, default: bool = False, env: dict | None = None) -> bool:
     """"On unless explicitly off": true for any value not in ``_OFF_VALUES``.
@@ -158,6 +208,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None,
     return max(minimum, val) if minimum is not None else val
 
 
+# ── fail-closed production guards ─────────────────────────────────────────────
 
 def sandbox_required(env: dict | None = None) -> bool:
     """Whether the OS sandbox (unshare namespaces + priv drop) is mandatory.
@@ -175,6 +226,34 @@ def net_lockdown_enabled(env: dict | None = None) -> bool:
     return env_truthy(NET_LOCKDOWN_ENV, default=True, env=env)
 
 
+def refiner_task_enabled(env: dict | None = None) -> bool:
+    """Whether the validator accepts and evaluates Refiner-task (Challenge 2)
+    submissions in its rounds. ON by default, paying the refiner pool's share
+    of emission (``refiner_emission_share``); ``SN125_REFINER_TASK=0`` turns it off,
+    and with it off a refiner envelope is rejected at the gate and nothing else
+    in a round changes. With the variable unset the inputs (suite,
+    decontamination list, pinned baseline) must resolve from the package or
+    the task silently stays off; set to ``1`` the validator refuses to start on
+    a half-configured task instead (roundsm.refiner_round)."""
+    return env_truthy(REFINER_TASK_ENV, default=True, env=env)
+
+
+def refiner_task_explicit(env: dict | None = None) -> bool:
+    """True when the operator set ``SN125_REFINER_TASK`` at all (either way)."""
+    src = os.environ if env is None else env
+    return REFINER_TASK_ENV in src
+
+
+def refiner_emission_share(env: dict | None = None) -> float:
+    """Share of miner emission routed to the Refiner task's pool (default
+    ``config.REFINER_EMISSION_SHARE``, 0.5): the refiner frontier pays that
+    share of the weight vector by its own progress-scaled rule, the optimizer
+    frontier the rest. 0 makes the task publish-only (scored and published,
+    nothing paid); anything outside [0, 1] makes the validator refuse to start."""
+    from .config import REFINER_EMISSION_SHARE
+    return env_float(REFINER_EMISSION_SHARE_ENV, REFINER_EMISSION_SHARE, env=env)
+
+
 def use_optproc(env: dict | None = None) -> bool:
     """Route miner optimizer steps through the CUDA-IPC isolated process."""
     return env_truthy(USE_OPTPROC_ENV, default=False, env=env)
@@ -188,13 +267,14 @@ def sandbox_mode(env: dict | None = None) -> str:
     return raw if raw in SANDBOX_MODES else "namespaces"
 
 
+# ── cloud provider chain + box-probe band ─────────────────────────────────────
 
 def cloud_provider_chain(env: dict | None = None) -> list[str]:
     """Ordered provider failover chain for B200 rentals.
 
     Precedence: SN125_CLOUD_PROVIDERS (comma-separated, in failover order) →
     legacy SN125_CLOUD_PROVIDER (single provider, kept as an explicit operator
-    override) → the default ``lambda,targon`` chain. Names are lower-cased and
+    override) → ``DEFAULT_CLOUD_PROVIDER_CHAIN`` (``runpod``). Names are lower-cased and
     de-duplicated preserving order; membership/lium checks live in
     ``cloud.ensure_scoring_providers`` (this module stays import-light)."""
     raw = env_str(CLOUD_PROVIDERS_ENV, env=env)
@@ -226,6 +306,7 @@ def box_probe_ref_sts(env: dict | None = None) -> float:
     return env_float(BOX_PROBE_REF_STS_ENV, 0.0, minimum=0.0, env=env)
 
 
+# ── infra: R2 + Hugging Face ──────────────────────────────────────────────────
 
 def hf_home(env: dict | None = None) -> str:
     """Resolved Hugging Face home dir (``HF_HOME`` or the user default)."""
@@ -259,7 +340,13 @@ def make_r2_client(env: dict | None = None):
     if not all([cfg["endpoint"], cfg["access_key"], cfg["secret_key"], cfg["bucket"]]):
         return None
     import boto3
+    from botocore.config import Config
+    # SigV4 + region "auto" explicitly: with boto3's defaults a PRESIGNED URL for
+    # a custom endpoint is signed with SigV2, which R2 rejects with 401 — the
+    # box-side checkpoint uploads (cloud._upload_checkpoints) and any presigned
+    # download depend on this. Plain API calls were already SigV4.
     return boto3.client(
         "s3", endpoint_url=cfg["endpoint"],
         aws_access_key_id=cfg["access_key"],
-        aws_secret_access_key=cfg["secret_key"])
+        aws_secret_access_key=cfg["secret_key"],
+        region_name="auto", config=Config(signature_version="s3v4"))

@@ -15,12 +15,12 @@ from typing import Any
 
 from ..config import (
     BURN_UID, LAUNCH_BURN_FRACTION_FLOOR, LAUNCH_BURN_SCHEDULE,
-    LAUNCH_FIRST_CYCLE_DAYS,
+    LAUNCH_FIRST_CYCLE_DAYS, REFINER_START_TIMESTAMP, ROUND_GRID_ANCHOR_TIMESTAMP,
 )
 
 
 SN125_VERSION_FALLBACK = "0.1.0"
-BURN_KEY = "__BURN__"
+BURN_KEY = "__BURN__"          # mirrors Validator.BURN_KEY
 RAO_PER_TAO = 10**9
 
 AUDIENCE_NOTES = {
@@ -62,6 +62,11 @@ EMISSIONS = {
     "burn_schedule": list(LAUNCH_BURN_SCHEDULE),
     "research_review_after_days": LAUNCH_FIRST_CYCLE_DAYS,
     "research_pause_scheduled": False,
+    # Round schedule: rounds open on a 24 h grid anchored here (0 = no grid),
+    # and Challenge 2 is live from the round that opens at its start instant.
+    "round_grid_anchor": int(ROUND_GRID_ANCHOR_TIMESTAMP or 0),
+    "round_period_s": 86400,
+    "refiner_start_timestamp": int(REFINER_START_TIMESTAMP or 0),
 }
 
 
@@ -114,6 +119,7 @@ def _normalize_dash_checkpoints(cps: list[Any]) -> list[dict[str, Any]]:
             "step": int(_num(c.get("step"), 0)),
             "eval_loss": _num(c.get("eval_loss"), 0.0),
             "sha256": _short_hash(str(c.get("sha256", "")), 16),
+            # Box-local artifact refs never belong in public dashboard JSON.
             "uri": "" if _is_local_artifact_ref(uri) else uri,
         })
     out.sort(key=lambda r: (r["pct"], r["step"]))
@@ -124,6 +130,149 @@ def _round_files(rounds_dir: Path) -> list[Path]:
     if not rounds_dir.exists():
         return []
     return sorted(rounds_dir.glob("*.json"), reverse=True)
+
+
+def _refiner_frontier_summary(fr: Any) -> dict[str, Any] | None:
+    """Public view of the refiner frontier settled in a round: bar, pool payout,
+    the event (if one confirmed), what is awaiting confirmation."""
+    if not isinstance(fr, dict):
+        return None
+    ev = fr.get("new_event") if isinstance(fr.get("new_event"), dict) else None
+    return {
+        "scheme": fr.get("scheme", ""),
+        "emission_share": _num(fr.get("emission_share"), 0.0),
+        "unit": fr.get("improvement_unit", "suite_points"),
+        "bar": fr.get("min_improvement_threshold"),
+        "floor": fr.get("min_improvement_floor"),
+        "baseline_score": fr.get("baseline_score"),
+        "frontier_score": fr.get("frontier_score"),
+        "leader_hotkey": fr.get("leader_hotkey", ""),
+        "progress": fr.get("progress"),
+        "full_pay_reference": fr.get("full_pay_reference"),
+        "payable_share": fr.get("payable_share"),
+        "burned_share": fr.get("burned_share"),
+        "new_event": ({"hotkey": ev.get("hotkey", ""), "commit_hash": _short_hash(str(ev.get("commit_hash", "")), 16),
+                       "improvement": ev.get("improvement"), "suite_score": ev.get("suite_score"),
+                       "event_id": ev.get("event_id", "")} if ev else None),
+        "pending": [{"hotkey": p.get("hotkey", ""), "commit_hash": _short_hash(str(p.get("commit_hash", "")), 16),
+                     "improvement": p.get("improvement"), "suite_score": p.get("suite_score"),
+                     "submission_round_id": p.get("source_round_id", "")}
+                    for p in (fr.get("pending_confirmation") or []) if isinstance(p, dict)],
+        "events": [{"hotkey": e.get("hotkey", ""), "improvement": e.get("improvement"), "age_days": e.get("age_days"),
+                    "share": e.get("share"), "suite_score": e.get("suite_score")}
+                   for e in (fr.get("events") or []) if isinstance(e, dict)],
+        "weights": {hk: w for hk, w in (fr.get("weights") or {}).items() if isinstance(w, (int, float))},
+    }
+
+
+def _refiner_round_summary(rd: dict[str, Any]) -> dict[str, Any] | None:
+    """Public view of a round's ``refiner_task`` block (Challenge 2): per-entry
+    suite scores and provenance, nothing box-local, plus the frontier the
+    round settled. ``None`` when the round carried no refiner task at all —
+    the summary is then exactly what it was before the task existed."""
+    block = rd.get("refiner_task")
+    if not isinstance(block, dict) or not (block.get("submissions") or block.get("frontier")):
+        return None
+    entries = []
+    for ch, e in (block.get("submissions") or {}).items():
+        if not isinstance(e, dict):
+            continue
+        bench = e.get("bench") or {}
+        stats = e.get("refiner_stats") or {}
+        task = e.get("task") or {}
+        # task_scores = {task_id: {"score", "per_task": {bench task: {metric: {submission, baseline, delta}}}}}
+        tasks = {}
+        for rec in (e.get("task_scores") or {}).values():
+            for name, metrics in ((rec.get("per_task") or {}).items() if isinstance(rec, dict) else []):
+                pcn = (metrics or {}).get("prob_correct_norm") or (metrics or {}).get("acc") or {}
+                if isinstance(pcn, dict):
+                    tasks[name] = {"submission": pcn.get("submission"), "baseline": pcn.get("baseline"),
+                                   "delta": pcn.get("delta")}
+        comp = e.get("components") or {}
+        entries.append({
+            "hotkey": e.get("hotkey", ""),
+            "commit_hash": _short_hash(str(ch), 16),
+            "score": e.get("score"),
+            "suite_submission": bench.get("submission"),
+            "suite_baseline": bench.get("baseline"),
+            "baseline_source": "pinned" if str(bench.get("baseline_source") or "").endswith(".json") else
+                               ("trained on the box" if bench.get("baseline_source") == "run" else
+                                str(bench.get("baseline_source") or "")),
+            "heldout_submission": comp.get("heldout_loss_submission"),
+            "heldout_baseline": comp.get("heldout_loss_baseline"),
+            "weights": e.get("weights"),
+            "source_sha256": _short_hash(str(e.get("source_sha256") or ""), 16),
+            "signature": e.get("signature", ""),
+            "seed": task.get("seed"),
+            "budget_seconds": task.get("compute_budget_seconds"),
+            "steps": stats.get("final_step"),
+            "lessons": stats.get("lessons"),
+            "entries_consumed": stats.get("entries_consumed"),
+            "learn_fraction": stats.get("learn_fraction"),
+            "plan_seconds": stats.get("plan_seconds"),
+            "tasks": tasks,
+            "paired": e.get("paired"),
+            "suite_delta": comp.get("suite_delta", e.get("score")),
+            "gates": e.get("gates"),
+            "checkpoints": [{"pct": c.get("pct"), "step": c.get("step"), "sha256": c.get("sha256"),
+                             "uri": c.get("uri")} for c in (e.get("checkpoints") or []) if isinstance(c, dict)],
+            "weights_archive": e.get("refiner_weights_archive", ""),
+            "provider": ((e.get("provenance") or {}).get("provider") if isinstance(e.get("provenance"), dict) else ""),
+        })
+    entries.sort(key=lambda x: _num(x.get("score"), -999.0), reverse=True)
+    return {
+        "scheme": block.get("scheme", ""),
+        "task_id": block.get("task_id", ""),
+        "emission_share": _num(block.get("emission_share"), 0.0),
+        "suite": block.get("suite") or {},
+        "decontam_sha256": block.get("decontam_sha256", ""),
+        "baseline_sha256": block.get("baseline_sha256", ""),
+        "signature": block.get("signature", ""),
+        "entries": entries,
+        "best": entries[0] if entries else None,
+        "frontier": _refiner_frontier_summary(block.get("frontier")),
+    }
+
+
+def _refiner_overview(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Top-level Challenge-2 section: is the task on, what it pays, the latest
+    frontier state (bar, leader, payable share, pending confirmations), every
+    published refiner result newest first, and the best per hotkey."""
+    rounds = [(r["round_id"], r["timestamp"], r["refiner"]) for r in summaries if r.get("refiner")]
+    results, best_by_hotkey = [], {}
+    for rid, ts, blk in rounds:
+        for e in blk["entries"]:
+            rec = {"round_id": rid, "timestamp": ts, **e}
+            results.append(rec)
+            cur = best_by_hotkey.get(e["hotkey"])
+            if cur is None or _num(e.get("score"), -999.0) > _num(cur.get("score"), -999.0):
+                best_by_hotkey[e["hotkey"]] = rec
+    latest = rounds[0][2] if rounds else None
+    share = _num(latest["emission_share"], 0.0) if latest else 0.0
+    frontier = latest.get("frontier") if latest else None
+    events = [{"round_id": rid, "timestamp": ts, **blk["frontier"]["new_event"]}
+              for rid, ts, blk in rounds if blk.get("frontier") and blk["frontier"].get("new_event")]
+    start_ts = int(REFINER_START_TIMESTAMP or 0)
+    opens_at = (time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(start_ts))
+                if start_ts and not rounds else "")
+    return {
+        "enabled": bool(rounds),
+        "status": ((f"opens {opens_at}" if opens_at else "not yet live") if not rounds else
+                   "publish-only" if share <= 0 else f"pays {share:.0%} of emission"),
+        "start_timestamp": start_ts,
+        "round_grid_anchor": int(ROUND_GRID_ANCHOR_TIMESTAMP or 0),
+        "task_id": latest["task_id"] if latest else "RF1_smol_360M",
+        "emission_share": share,
+        "suite": latest["suite"] if latest else {},
+        "signature": latest["signature"] if latest else "",
+        "frontier": frontier,
+        "events": events,
+        "rounds_with_results": sum(1 for _, _, blk in rounds if blk["entries"]),
+        "total_results": len(results),
+        "results": results[:200],
+        "leaderboard": sorted(best_by_hotkey.values(), key=lambda x: _num(x.get("score"), -999.0), reverse=True),
+        "docs": ["docs/REFINER_TASK.md", "docs/REFINER_RESEARCH.md"],
+    }
 
 
 def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
@@ -155,6 +304,7 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
         sub = submissions.get(hotkey, {})
         total_weight += _num(sub.get("weight", 0.0))
 
+    # Burn can be explicit on real round files; otherwise infer conservatively.
     economics = rd.get("economics", {}) or {}
     if "burned_weight" in economics:
         burned_weight = _num(economics.get("burned_weight"))
@@ -167,6 +317,8 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
         if loss is not None:
             base_losses[task_id] = loss
 
+    # Quartile audit checkpoints (25/50/75/100%) — the audit-replay replacement.
+    # Count across all submissions; expose the best submission's list for detail.
     audit_checkpoint_count = 0
     for sub in submissions.values():
         cps = sub.get("checkpoints", []) or []
@@ -178,11 +330,15 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
     best_sub = submissions.get(best_hotkey, {}) or {}
     best_checkpoints = _normalize_dash_checkpoints(best_sub.get("checkpoints", []) or [])
     if not best_checkpoints:
+        # Rich round files keep quartile checkpoints under per-task curves.
         for curve in (best_sub.get("curves", {}) or {}).values():
             if isinstance(curve, dict) and curve.get("checkpoints"):
                 best_checkpoints = _normalize_dash_checkpoints(curve["checkpoints"])
                 break
 
+    # Best-vs-baseline held-out detail from the winning submission's task_scores.
+    # This is what lets the dashboard chart actual loss frontier movement rather
+    # than only the abstract final_score.
     best_score_rec = _as_score(best_sub)
     best_loss = base_loss = None
     best_steps = base_steps = 0
@@ -195,7 +351,7 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
             base_loss = _num(ts_rec.get("base_final_loss"))
         best_steps = int(_num(ts_rec.get("sub_steps"), 0))
         base_steps = int(_num(ts_rec.get("base_steps"), 0))
-        break
+        break  # production is single-task
     if base_loss is None and base_losses:
         base_loss = next(iter(base_losses.values()))
     if best_loss is None and best_checkpoints:
@@ -204,6 +360,7 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
     if best_loss is not None and base_loss:
         improvement = max(0.0, (base_loss - best_loss) / base_loss)
 
+    # Optimizer-family mix among scored submissions (for the round texture).
     families: dict[str, int] = {}
     for sub in submissions.values():
         score = _as_score(sub)
@@ -212,6 +369,10 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
         fam = _optimizer_family(sub, score)
         families[fam] = families.get(fam, 0) + 1
 
+    # Hardware provenance: which provider fleet scored each submission, plus
+    # the winning submission's throughput-band evidence (pre/post box probe,
+    # achieved rate). Written by the validator (roundsm/live.py) — public-safe
+    # scalars only.
     providers: dict[str, int] = {}
     for sub in submissions.values():
         prov = ((sub.get("provenance") or {}).get("provider")
@@ -220,6 +381,9 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
             providers[prov] = providers.get(prov, 0) + 1
     best_provenance = (best_sub.get("provenance") or {}) if isinstance(best_sub, dict) else {}
 
+    # Frontier state written by the validator's reward path: whether this
+    # round created a (confirmed) frontier event, which candidates are still
+    # awaiting their validator-funded confirmation run, and the bar (nats).
     fr = rd.get("frontier_rewards") or {}
     new_event = fr.get("new_event") if isinstance(fr.get("new_event"), dict) else None
     frontier = {
@@ -227,6 +391,9 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
         "min_improvement_threshold": _num(fr.get("min_improvement_threshold"), 0.0),
         "confirmation_runs": int(_num(fr.get("confirmation_runs"), 0)),
         "leader_hotkey": fr.get("leader_hotkey", ""),
+        # Progress-scaled payout inputs (scheme frontier-progress-scaled-v3):
+        # recent verified progress, the full-pay reference and the share of
+        # emission that progress bought this round.
         "scheme": fr.get("scheme", ""),
         "progress_nats": _num(fr.get("progress_nats"), 0.0),
         "full_pay_reference_nats": _num(fr.get("full_pay_reference_nats"), 0.0),
@@ -250,6 +417,8 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
 
     tasks = rd.get("tasks", []) or []
     task = tasks[0] if tasks else {}
+    # Who was paid this round (frontier-event hotkeys, which need not have a
+    # submission in this round) — the emission split the dashboard shows.
     paid_weights = {
         str(hk): _num(w) for hk, w in (rd.get("weights") or {}).items()
         if hk != BURN_KEY and _num(w) > 0
@@ -284,6 +453,7 @@ def _round_summary(path: Path, rd: dict[str, Any]) -> dict[str, Any]:
         "audit_checkpoint_count": audit_checkpoint_count,
         "best_checkpoints": best_checkpoints,
         "pause_reasons": list(rd.get("pause_reasons", []) or []),
+        "refiner": _refiner_round_summary(rd),
         "task": {
             "family": task.get("task_id", task.get("model_config", "FineWeb-Edu")),
             "model": task.get("model_config", "SmolLM2-family"),
@@ -337,8 +507,13 @@ def _leaderboard(rounds: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, An
                 row["code_hash"] = sub.get("code_hash", "")
             family = _optimizer_family(sub, score)
             row["families"][family] = row["families"].get(family, 0) + 1
+        # Emission is paid to confirmed frontier-event hotkeys via the round's
+        # weight map, whether or not they submitted again this round; that is
+        # what "earned" must count (the per-submission weight is 0 for a leader
+        # who does not resubmit, and there is no submission at all in the
+        # confirmation round).
         weight_map = rd.get("weights") if isinstance(rd.get("weights"), dict) else None
-        if not weight_map:
+        if not weight_map:   # legacy round files carry weights per submission only
             weight_map = {hk: (sub or {}).get("weight", 0.0)
                           for hk, sub in (rd.get("submissions", {}) or {}).items()}
         for hotkey, weight in weight_map.items():
@@ -346,7 +521,7 @@ def _leaderboard(rounds: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, An
             if hotkey != BURN_KEY and w > 0:
                 paid_total[str(hotkey)] = paid_total.get(str(hotkey), 0.0) + w
     for hotkey, w in paid_total.items():
-        if hotkey in by_hotkey:
+        if hotkey in by_hotkey:   # rounds arrive newest-first; apply after the scan
             by_hotkey[hotkey]["weight"] = w
             by_hotkey[hotkey]["earned_tokens"] = w * EMISSIONS["miner_daily_tokens"]
 
@@ -475,7 +650,7 @@ def _public_payments(ledger_path: Path | None, treasury_coldkey: str,
         return {**base, "reason": "no ledger configured"}
     try:
         credits = build_credits(Path(ledger_path), recent_events=recent_events)
-    except Exception as exc:
+    except Exception as exc:  # the dashboard must never fail on the ledger
         return {**base, "reason": f"{type(exc).__name__}: {exc}"}
     if not credits.get("available"):
         return {**base, "reason": credits.get("reason") or credits.get("error", "")}
@@ -517,7 +692,7 @@ def _public_payments(ledger_path: Path | None, treasury_coldkey: str,
         "totals": credits.get("totals") or {},
         "events_total": credits.get("events_total", len(events)),
         "accounts": accounts,
-        "recent_events": events[::-1],
+        "recent_events": events[::-1],          # newest first
     }
 
 
@@ -628,6 +803,7 @@ def _miners_index(round_pairs: list[tuple[Path, dict[str, Any]]],
             "history": [],
         })
 
+    # Per-round history, oldest first so "last" fields end on the newest round.
     frontier_by_round = {s["round_id"]: s for s in summaries}
     for path, rd in reversed(round_pairs):
         rid = str(rd.get("round_id", path.stem))
@@ -673,6 +849,7 @@ def _miners_index(round_pairs: list[tuple[Path, dict[str, Any]]],
                 r["family"] = fam
                 if sub.get("code_hash"):
                     r["code_hash_short"] = str(sub["code_hash"])[:12]
+        # Legacy round files: scored submissions without an FSM report.
         for hk, sub in subs.items():
             if hk in seen or not isinstance(sub, dict):
                 continue
@@ -702,6 +879,7 @@ def _miners_index(round_pairs: list[tuple[Path, dict[str, Any]]],
             if _is_miner_key(hk, by_hk) and _num(w) > 0:
                 rec(str(hk))["earned_tokens"] += _num(w) * miner_daily_tokens
 
+    # Payout now + frontier events from the newest published round.
     fr = (latest or {}).get("frontier_rewards") or {}
     newest_weights = (latest or {}).get("weights") or {}
     for hk, w in newest_weights.items():
@@ -716,6 +894,7 @@ def _miners_index(round_pairs: list[tuple[Path, dict[str, Any]]],
     if fr.get("leader_hotkey"):
         rec(str(fr["leader_hotkey"]))["is_leader"] = True
 
+    # What each hotkey is doing right now: live round beats queue beats record.
     for q in queue.get("deferred") or []:
         if q.get("hotkey"):
             r = rec(str(q["hotkey"]))
@@ -805,8 +984,14 @@ def build_dashboard_data(
     leaderboard = _leaderboard(round_pairs)
     latest = _latest_round_public(round_pairs[0][1]) if round_pairs else None
     cloud = _read_json(cloud_status_path, {}) if cloud_status_path else {}
+    # B200-only capacity-aware delay: surfaced at top-level so the dashboard can
+    # render a prominent banner without digging into the raw cloud blob. None
+    # when running normally; a dict while the round is PAUSED awaiting B200.
     capacity_delay = cloud.get("capacity_delay") if isinstance(cloud, dict) else None
 
+    # Quartile audit checkpoints (25/50/75/100%) — the audit-replay replacement.
+    # Top-level summary so the dashboard can show "audit artifacts captured" without
+    # digging into per-submission curves; detail = latest round's best submission.
     latest_for_audit = summaries[0] if summaries else None
     audit = {
         "total_checkpoints": sum(r.get("audit_checkpoint_count", 0) for r in summaries),
@@ -880,6 +1065,8 @@ def build_dashboard_data(
             "max_concurrent": int(_num(cloud.get("max_concurrent"), 8)),
             "cost_per_sub": _num(cloud.get("cost_per_sub"), 0.0),
             "resource_sku": cloud.get("resource_sku", "b200-small"),
+            # Ordered provider failover chain (rent from the first with B200
+            # capacity; pause only when all are dry).
             "providers": list(cloud.get("providers") or []),
         },
         "capacity_delay": capacity_delay,
@@ -891,6 +1078,7 @@ def build_dashboard_data(
                                 live_round, latest, miner_daily_tokens),
         "current_round": latest_summary,
         "leaderboard": leaderboard,
+        "refiner": _refiner_overview(summaries),
         "history": summaries,
         "cloud": cloud,
         "verification": _verification(summaries),
@@ -904,9 +1092,9 @@ def build_dashboard_data(
             ],
             "references": [
                 "README.md",
-                "docs/DESIGN.md",
-                "docs/SIMPLE_MECHANISM.md",
-                "docs/paper/Refinery_Subnet.md",
+                "docs/INCENTIVE_MECHANISM.md",
+                "docs/VERIFICATION.md",
+                "docs/REFINER_TASK.md",
             ],
         },
         "latest": latest,

@@ -21,6 +21,7 @@ def build_snapshot(rounds_dir: Path, cloud_status_path: Path | None, *,
         rounds_dir, cloud_status_path, validator_hotkey=validator_hotkey, version=version,
         ledger_path=ledger_path, state_path=state_path, audit_dir=audit_dir,
     )
+    # The source is the validator, not the dashboard host's local fixture directory.
     dashboard["network"]["status"] = "validator-artifacts"
     return {
         "schema": SNAPSHOT_SCHEMA,

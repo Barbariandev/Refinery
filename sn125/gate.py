@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 
 from sn125.sandbox import validate_source
 
-MAX_TOTAL_BYTES = 1_048_576
+MAX_TOTAL_BYTES = 1_048_576       # C8: ~1 MB total source
 MAX_FILES = 64
 MAX_PATH_LEN = 200
 
@@ -36,6 +36,7 @@ ALLOWED_EXTENSIONS = frozenset([
     ".md", ".txt",
 ])
 
+# Magic prefixes that can never appear in a text source file (C2).
 _BINARY_MAGICS: tuple[tuple[bytes, str], ...] = (
     (b"\x7fELF", "ELF object/shared library"),
     (b"MZ", "PE/DOS executable"),
@@ -55,18 +56,22 @@ _BINARY_MAGICS: tuple[tuple[bytes, str], ...] = (
     (b"\x80\x05", "pickle (protocol 5)"),
 )
 
+# PTX is plain text — magic checks can't catch it. These directives only ever
+# appear in PTX modules (or strings embedding one, which is the same attack).
 _PTX_DIRECTIVE_RE = re.compile(
     r"^\s*\.(version\s+\d+\.\d+|target\s+sm_\d+|visible\s+\.entry|address_size\s+\d+)",
     re.MULTILINE)
 
+# Inline asm in C/CUDA sources (best-effort, see module docstring).
 _INLINE_ASM_RE = re.compile(r"(?<![\w.])(__asm__|__asm|asm)\s*(\(|volatile\b|goto\b)")
 
 _C_LIKE_EXTENSIONS = frozenset([".c", ".h", ".cu", ".cuh", ".cpp", ".hpp", ".cc"])
 
-ENTROPY_MIN_BLOB_LEN = 512
-ENTROPY_BITS_PER_CHAR = 4.8
-DENSE_CONST_TOTAL_BYTES = 65_536
-DENSE_NUMERIC_LITERALS = 5_000
+# Entropy flag thresholds (C8 manual-screen feed; flags never reject).
+ENTROPY_MIN_BLOB_LEN = 512        # constants shorter than this are never flagged
+ENTROPY_BITS_PER_CHAR = 4.8       # base64 ~6.0, hex 4.0+dense, prose/code ~4.2-4.6
+DENSE_CONST_TOTAL_BYTES = 65_536  # total literal payload that flags regardless of entropy
+DENSE_NUMERIC_LITERALS = 5_000    # a 5k+ element inline number table is a data ship
 
 
 def shannon_bits_per_byte(data: bytes) -> float:
@@ -167,7 +172,7 @@ def validate_submission(files: dict[str, bytes]) -> GateResult:
     if total > MAX_TOTAL_BYTES:
         out.reasons.append(
             f"C8: total source size {total} > {MAX_TOTAL_BYTES} bytes")
-        return out
+        return out  # don't bother scanning a rejected-for-size payload
 
     for path, raw in sorted(files.items()):
         if not _check_path(path, out):

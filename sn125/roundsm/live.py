@@ -58,6 +58,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .. import settings
+from ..config import next_round_start, round_hold_until
 from .adapter import (
     classify_cloud_result,
     make_commit_collector,
@@ -70,19 +71,26 @@ from .audit import JsonlAuditLog, audit_emit, looks_like_crash, payload_record
 from .driver import (DEFAULT_LAUNCH_RETRY_S, DEFAULT_LAUNCH_WINDOW_S,
                      DEFAULT_OUTAGE_BACKOFF_S, DEFAULT_REVEAL_RETRY_S,
                      EvalResult, drive_round)
+from . import refiner_frontier
+from .refiner_round import (build_refiner_block, is_refiner_payload, load_refiner_round_config,
+                            refiner_job_for)
 from .round_fsm import MAX_EVAL_PER_ROUND, RoundConfig, RoundFSM, SubStatus
 from .state import default_state_path, load_loop_state, save_loop_state
 
 log = logging.getLogger("sn125.fsm")
 
+# Restart-at-safe-point protocol shared with sn125/autoupdate.py.
 RESTART_FLAG_ENV = "SN125_RESTART_FLAG"
-EXIT_RESTART = 75
-_BOUNDARY_POLL_S = 60.0
+EXIT_RESTART = 75            # EX_TEMPFAIL: "restart me" (supervisor applies updates)
+_BOUNDARY_POLL_S = 60.0      # how often the boundary sleep re-checks the flag
 
+# Defaults for the round windows (seconds) when the validator does not override
+# them. A 24h round = 3h commit + 1h reveal + ~20h evaluation, matching the
+# fixed-budget regime (SPEC §7); the eval phase itself consumes the rest.
 DEFAULT_COMMIT_WINDOW_S = 3 * 3600.0
 DEFAULT_REVEAL_WINDOW_S = 1 * 3600.0
 DEFAULT_ROUND_PERIOD_S = 24 * 3600.0
-DEFAULT_FAIRNESS_WINDOW = 3
+DEFAULT_FAIRNESS_WINDOW = 3   # retained for config compatibility; FIFO selection ignores it
 
 
 def _audit_heartbeat_interval() -> float:
@@ -267,18 +275,26 @@ def _reveal_retry_s(validator) -> float:
                                        "SN125_REVEAL_RETRY_S", DEFAULT_REVEAL_RETRY_S))
 
 
+_REFINER_CFG_FROM_VALIDATOR = object()
+
+
 def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
                       max_concurrent: int, audit=None,
-                      baseline_bundle: dict | None = None):
+                      baseline_bundle: dict | None = None,
+                      refiner_cfg=_REFINER_CFG_FROM_VALIDATOR):
     """Build ``evaluate_batch(payloads) -> {commit_hash: EvalResult}`` that fans the
     <=8 selected submissions across a thread pool (each call to the orchestrator's
     ``evaluate_submission`` acquires/releases its own rental slot, SPEC §4.4). The
     raw cloud dict per commit is stashed in ``sink`` so the loop can rebuild full
-    ``ScoreRecord``s (components/curves) for ``compute_weights`` afterwards."""
+    ``ScoreRecord``s (components/curves) for ``compute_weights`` afterwards.
+    ``refiner_cfg`` is the refiner config in force for the round (None: refiner
+    envelopes are not routed); it defaults to the validator's."""
     orch = validator._cloud_orch
     mode = getattr(validator, "mode", "prod")
+    if refiner_cfg is _REFINER_CFG_FROM_VALIDATOR:
+        refiner_cfg = getattr(validator, "_refiner_cfg", None)
     poll_s = max(1.0, _launch_retry_s(validator))
-    stop = threading.Event()
+    stop = threading.Event()   # set on urgent restart: workers stop polling
 
     def _has_capacity() -> bool:
         probe = getattr(orch, "has_b200_capacity", None)
@@ -307,6 +323,9 @@ def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
     def _attempt(commit_hash: str, payload: bytes, source: str, sub_uid: str,
                  attempt: int):
         started = time.time()
+        rf = refiner_job_for(payload, refiner_cfg)
+        if rf is not None:
+            return _attempt_refiner(commit_hash, payload, rf[0], rf[1], sub_uid, attempt, started)
         audit_emit(audit, "cloud_eval.start", commit_hash=commit_hash,
                    sub_uid=sub_uid, mode=mode, attempt=attempt,
                    resource=getattr(validator, "cloud_resource", ""),
@@ -327,7 +346,7 @@ def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
                     if "unexpected keyword argument 'audit'" not in str(e2):
                         raise
                     res = orch.evaluate_submission(source, round_id, sub_uid, mode=mode)
-        except Exception as e:
+        except Exception as e:  # cloud layer already retried; a raise == our fault
             audit_emit(audit, "cloud_eval.exception", commit_hash=commit_hash,
                        sub_uid=sub_uid, mode=mode, elapsed_s=time.time() - started,
                        error=str(e), error_type=type(e).__name__,
@@ -342,6 +361,32 @@ def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
                    reason=verdict.reason, failed=bool(res.get("failed")),
                    error=err, crashed=looks_like_crash(err),
                    raw_result=res)
+        return commit_hash, res, verdict
+
+    def _attempt_refiner(commit_hash: str, payload: bytes, source: str, job: dict,
+                         sub_uid: str, attempt: int, started: float):
+        """Refiner-task submission: same orchestrator, same box, a different
+        evaluator on it (``refiner-eval``). The rolling-best optimizer baseline
+        is not shipped; the job carries the pinned identity baseline instead."""
+        audit_emit(audit, "cloud_eval.start", commit_hash=commit_hash, sub_uid=sub_uid,
+                   mode=mode, attempt=attempt, task_id=job["task_id"],
+                   resource=getattr(validator, "cloud_resource", ""), **payload_record(payload))
+        try:
+            res = orch.evaluate_submission(source, round_id, sub_uid, mode=mode, audit=audit,
+                                           refiner_job=job)
+        except Exception as e:
+            audit_emit(audit, "cloud_eval.exception", commit_hash=commit_hash, sub_uid=sub_uid,
+                       mode=mode, task_id=job["task_id"], elapsed_s=time.time() - started,
+                       error=str(e), error_type=type(e).__name__, crashed=looks_like_crash(str(e)))
+            return commit_hash, None, EvalResult("infra_dq", reason=f"cloud raised: {e}")
+        res.setdefault("task_id", job["task_id"])
+        verdict = classify_cloud_result(res)
+        err = str(res.get("error", ""))
+        audit_emit(audit, "cloud_eval.result", commit_hash=commit_hash, sub_uid=sub_uid,
+                   mode=mode, attempt=attempt, task_id=job["task_id"],
+                   elapsed_s=time.time() - started, outcome=verdict.outcome, score=verdict.score,
+                   reason=verdict.reason, failed=bool(res.get("failed")), error=err,
+                   crashed=looks_like_crash(err), raw_result=res)
         return commit_hash, res, verdict
 
     def _one(item: tuple[str, bytes], deadline: float | None = None):
@@ -381,6 +426,9 @@ def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
                     sink[commit_hash] = raw
                 out[commit_hash] = ev
         except BaseException:
+            # Urgent restart (SIGINT) while boxes are running: do NOT wait for
+            # the in-flight evaluations (hours) — abandon them so the round can
+            # be recorded as aborted and the state checkpoint written now.
             stop.set()
             ex.shutdown(wait=False, cancel_futures=True)
             raise
@@ -452,12 +500,20 @@ def _eval_provenance(raw: dict) -> dict:
 def _build_results(fsm: RoundFSM, sink: dict[str, dict]):
     """From the SCORED submissions build the (results, sources, curve_data) triple
     that ``compute_weights`` / ``_save_round`` / ``_publish_attestation`` consume."""
-    from ..training import ScoreRecord
+    from ..training import ScoreRecord  # lazy: keep this module torch-free at load
 
     results: dict[str, ScoreRecord] = {}
     sources: dict[str, str] = {}
     curve_data: dict[str, dict] = {}
-    scored = [s for s in fsm.submissions.values() if s.status is SubStatus.SCORED]
+    # One row per hotkey (the reward path is hotkey-keyed). A hotkey can have
+    # more than one SCORED submission in a round (a carried-over deferral plus
+    # a fresh commit), so keep its BEST-scoring run deterministically (ties →
+    # lowest commit hash) instead of letting dict insertion order pick one and
+    # silently mismatch score/source/code_hash.
+    # Refiner-task submissions are settled in their own block (refiner_round):
+    # their score is a suite-score delta, not something this frontier can rank.
+    scored = [s for s in fsm.submissions.values()
+              if s.status is SubStatus.SCORED and not is_refiner_payload(s.payload)]
     scored.sort(key=lambda s: (s.hotkey, -(s.score if s.score is not None else float("-inf")),
                                s.commit_hash))
     chosen: dict[str, object] = {}
@@ -510,7 +566,7 @@ def _build_confirmations(jobs, verdicts: dict, sink: dict[str, dict]):
     """Translate confirmation-run verdicts into the ``confirmations`` argument
     of ``compute_weights`` ({code_hash: ScoreRecord | {outcome, reason}}) and the
     round-JSON ``confirmations`` section."""
-    from ..training import ScoreRecord
+    from ..training import ScoreRecord  # lazy: keep this module torch-free at load
 
     confirmations: dict = {}
     records: dict[str, dict] = {}
@@ -540,6 +596,42 @@ def _build_confirmations(jobs, verdicts: dict, sink: dict[str, dict]):
     return confirmations, records
 
 
+def _build_refiner_confirmations(jobs, verdicts: dict, sink: dict[str, dict], provenance=None):
+    """Translate refiner confirmation-run verdicts into the ``confirmations``
+    argument of ``refiner_frontier.settle`` ({commit_hash: {outcome, reason,
+    result}}) and the block's ``confirmations`` section (one record per run,
+    with the suite score, gates and signature the replay needs)."""
+    from .refiner_round import _RESULT_KEYS, refiner_signature
+    confirmations: dict = {}
+    records: dict[str, dict] = {}
+    for key, _payload, p in jobs:
+        ch = str(p.get("commit_hash", ""))
+        ev = verdicts.get(key) or EvalResult("infra_dq", reason="confirmation returned no result")
+        raw = sink.get(key) or {}
+        rec = {"hotkey": p.get("hotkey", ""), "commit_hash": ch,
+               "submission_round_id": p.get("source_round_id", ""),
+               "outcome": ev.outcome, "reason": ev.reason}
+        if ev.outcome == "scored":
+            rec["score"] = ev.score
+            s = raw.get("submission") or {}
+            rec["bench"] = {"submission": (s.get("bench") or {}).get("score"),
+                            "baseline": ((raw.get("baseline") or {}).get("bench") or {}).get("score"),
+                            "submission_checkpoint_sha256": (s.get("bench") or {}).get("checkpoint_sha256")}
+            for k in _RESULT_KEYS:
+                if raw.get(k) is not None:
+                    rec[k] = raw[k]
+            rec["signature"] = refiner_signature(raw)
+            if provenance is not None:
+                prov = provenance(raw)
+                if prov:
+                    rec["provenance"] = prov
+            confirmations[ch] = {"outcome": "scored", "reason": "", "result": rec}
+        else:
+            confirmations[ch] = {"outcome": ev.outcome, "reason": ev.reason, "result": None}
+        records[key] = rec
+    return confirmations, records
+
+
 def run_fsm_validator(validator, *, max_rounds: int | None = None,
                       clock=time.time, sleep=time.sleep) -> None:
     """Drive the validator through the FSM round loop. Runs forever in production
@@ -556,6 +648,10 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
     inventory, default 4h), ``fsm_launch_retry_s`` (inventory poll cadence).
     """
     reg = validator.payment_registry
+    if not hasattr(validator, "_refiner_cfg"):
+        # Refiner task (Challenge 2): None unless SN125_REFINER_TASK is set.
+        # Raises (the validator does not start) on a half-configured task.
+        validator._refiner_cfg = load_refiner_round_config()
     fee_rao = int(validator.round_fee_rao)
     if fee_rao <= 0:
         raise ValueError("round_fee_rao must be positive for the FSM loop")
@@ -573,7 +669,7 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
             return base_max_concurrent
         try:
             affordable = int(orch.affordable_concurrency())
-        except Exception as e:
+        except Exception as e:  # pricing lookup failure must not stop the loop
             log.warning("affordable_concurrency failed (%s); keeping %d", e, base_max_concurrent)
             return base_max_concurrent
         if affordable < base_max_concurrent:
@@ -588,7 +684,7 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
            if getattr(validator, "wallet", None) else "local")
 
     carryover: list = []
-    recent_rounds: list[set[str]] = []
+    recent_rounds: list[set[str]] = []   # last `fairness_window` rounds' evaluated hotkeys
     round_num = 0
     state_path = _state_path_for(validator)
     restored = load_loop_state(state_path) if state_path is not None else None
@@ -611,27 +707,62 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
         weight_refresh_stop = _start_weight_refresh(validator)
     publisher = _start_artifact_publisher(validator)
     payment_watch_stop = _start_payment_watcher(validator, reg, fee_rao)
+    # Ledger reconciliation before anyone commits again: credits a previous
+    # process could not settle correctly are returned here, once, as ledger
+    # events (see _reconcile_ledger_at_startup for the rules and the record).
     _reconcile_ledger_at_startup(validator, reg)
-    rounds_this_process = 0
+    rounds_this_process = 0     # max_rounds counts THIS process's rounds, not round_num
+    # Round schedule (config.ROUND_GRID_ANCHOR_TIMESTAMP): rounds open on the
+    # 24 h grid anchored on the launch instant when they can, and no round
+    # opens so late before the launch that it would still be running at it.
+    grid_anchor = int(getattr(validator, "round_grid_anchor", 0) or 0)
+    refiner_start = int(getattr(validator, "refiner_start_timestamp", 0) or 0)
     while max_rounds is None or rounds_this_process < max_rounds:
+        hold_until = round_hold_until(clock(), round_period_s, grid_anchor)
+        if hold_until > clock():
+            log.info("  holding the next round for the launch instant %s (in %.0fs); "
+                     "payments, weight refresh and publishing keep running",
+                     _utc(hold_until), hold_until - clock())
+            while hold_until - clock() > 0:
+                sleep(min(hold_until - clock(), _BOUNDARY_POLL_S))
+                if _restart_requested(validator):
+                    restart_reason = "restart"
+                    break
+            if restart_reason is not None:
+                log.info("  restart requested while holding for the launch instant; "
+                         "stopping before round #%d (state checkpointed to %s)",
+                         round_num, state_path)
+                break
         round_start = clock()
         round_id = f"round_{round_num:06d}_{int(round_start)}_{vhk}"
+        # Challenge 2 is live from the round that opens at its start instant.
+        rf_cfg = _refiner_cfg_for_round(validator, round_start)
+        rf_not_yet = (rf_cfg is None and getattr(validator, "_refiner_cfg", None) is not None
+                      and refiner_start > round_start)
         operator_interrupt: BaseException | None = None
-        nothing_launched = False
+        nothing_launched = False     # every selected commit carried for want of a GPU
         audit = _make_round_audit(validator, round_id)
         heartbeat_stop = _start_validator_heartbeat(validator, audit, round_start, clock)
         log.info("=" * 60)
         log.info("  FSM %s", round_id)
         max_concurrent = _affordable_now()
+        chain_block = _chain_block(validator)      # the block the round opened at
         try:
             audit_emit(audit, "round.start",
                        round_num=round_num, round_start=round_start,
+                       chain_block=chain_block,
+                       round_grid_anchor=grid_anchor,
+                       refiner_live=rf_cfg is not None,
+                       refiner_start_timestamp=refiner_start,
                        commit_window_s=commit_window_s,
                        reveal_window_s=reveal_window_s,
                        round_period_s=round_period_s,
                        max_concurrent=max_concurrent,
                        fee_rao=fee_rao,
                        validator_fingerprint=_validator_fingerprint(validator))
+            if rf_not_yet:
+                log.info("  refiner task (Challenge 2) opens at %s; this round is Challenge 1 only",
+                         _utc(refiner_start))
             meta = validator.sync_metagraph()
             my_hk = (validator.wallet.hotkey.ss58_address
                      if getattr(validator, "wallet", None) else None)
@@ -648,6 +779,10 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                            for ai in axons
                        ])
 
+            # Fee pin must publish BEFORE the commit window opens (§8); then credit
+            # observed finalized treasury transfers (BittensorChainView in prod).
+            # The background payment watcher keeps the ledger current between
+            # rounds; this sync just closes the gap to the commit window.
             reg.pin_fee(round_id, fee_rao)
             granted = _sync_payments(reg)
             log.info("  fee pinned %d rao; synced %d treasury transfer(s); %d funded coldkey(s)",
@@ -664,6 +799,10 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
 
             cloud_sink: dict[str, dict] = {}
             baseline_bundle = None
+            # Any cloud backend (single provider or a failover chain like
+            # "lambda,targon") needs the rolling-best baseline bundle shipped
+            # to the box — without it prod-eval would retrain the AdamW
+            # baseline on every rental, doubling the eval cost.
             _backend = str(getattr(validator, "backend", "")).strip().lower()
             if _backend not in ("", "local") and getattr(validator, "mode", "prod") == "prod":
                 audit_emit(audit, "baseline.prepare.start",
@@ -676,26 +815,40 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                            baseline=getattr(validator, "baseline", ""))
             recent_hotkeys = tuple(hk for r in recent_rounds for hk in r)
 
+            # Frontier confirmation runs (validator-funded; see config
+            # FRONTIER_CONFIRMATION_RUNS). They rent from the same pool and run
+            # concurrently with the round's evals, so each one takes a slot
+            # away from this round's selection instead of blowing the round
+            # past its period.
             conf_jobs = _pending_confirmation_jobs(validator, audit)
+            # Refiner-frontier confirmations ride the same batch: their payload
+            # is the envelope, which _make_cloud_batch routes to refiner-eval.
+            rf_conf_jobs = refiner_frontier.pending_jobs(getattr(validator, "rounds_dir", ""), rf_cfg)
             conf_sink: dict[str, dict] = {}
             conf_verdicts: dict = {}
             conf_thread = None
-            if conf_jobs:
+            if conf_jobs or rf_conf_jobs:
                 audit_emit(audit, "confirmation.launch",
                            jobs=[{"key": k, "hotkey": p.get("hotkey", ""),
                                   "code_hash": p.get("code_hash", ""),
                                   "submission_round_id": p.get("source_round_id", "")}
-                                 for k, _b, p in conf_jobs])
-                log.info("  launching %d frontier confirmation run(s)", len(conf_jobs))
+                                 for k, _b, p in conf_jobs] +
+                                [{"key": k, "hotkey": p.get("hotkey", ""), "task": "refiner",
+                                  "commit_hash": p.get("commit_hash", ""),
+                                  "submission_round_id": p.get("source_round_id", "")}
+                                 for k, _b, p in rf_conf_jobs])
+                log.info("  launching %d frontier confirmation run(s)%s", len(conf_jobs),
+                         f" + {len(rf_conf_jobs)} refiner" if rf_conf_jobs else "")
                 _conf_batch = _make_cloud_batch(validator, round_id, conf_sink,
                                                 max_concurrent, audit,
-                                                baseline_bundle=baseline_bundle)
-                _conf_payloads = [(k, b) for k, b, _p in conf_jobs]
+                                                baseline_bundle=baseline_bundle,
+                                                refiner_cfg=rf_cfg)
+                _conf_payloads = [(k, b) for k, b, _p in conf_jobs] + [(k, b) for k, b, _p in rf_conf_jobs]
 
                 def _run_confirmations():
                     try:
                         conf_verdicts.update(_conf_batch(_conf_payloads))
-                    except Exception as e:
+                    except Exception as e:  # never let a confirmation kill the round
                         audit_emit(audit, "confirmation.exception", error=str(e),
                                    error_type=type(e).__name__)
                         log.error("  confirmation batch raised: %s", e)
@@ -703,7 +856,7 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                 conf_thread = threading.Thread(target=_run_confirmations,
                                                name="sn125-confirmations", daemon=True)
                 conf_thread.start()
-            round_max_eval = max(1, max_concurrent - len(conf_jobs))
+            round_max_eval = max(1, max_concurrent - len(conf_jobs) - len(rf_conf_jobs))
             outcome = drive_round(
                 fsm,
                 collect_commits=make_commit_collector(
@@ -714,10 +867,14 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                     validator.dendrite, axons, round_id, submission_cls,
                     on_event=lambda m: log.info("    %s", m),
                     audit=audit),
-                gate=make_source_gate(),
+                gate=make_source_gate(
+                    refiner_enabled=rf_cfg is not None,
+                    refiner_disabled_reason=(f"refiner task opens at {_utc(refiner_start)}"
+                                             if rf_not_yet else None)),
                 evaluate_batch=_make_cloud_batch(validator, round_id, cloud_sink,
                                                  max_concurrent, audit,
-                                                 baseline_bundle=baseline_bundle),
+                                                 baseline_bundle=baseline_bundle,
+                                                 refiner_cfg=rf_cfg),
                 recent_hotkeys=recent_hotkeys,
                 carryover=carryover,
                 sleep_until=lambda ts: _sleep_until(
@@ -734,6 +891,9 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                 on_event=lambda m: log.info("    %s", m),
                 audit=audit,
             )
+            outcome.report["opened_at"] = round_start
+            outcome.report["opened_at_chain_block"] = chain_block
+            outcome.report["refiner_live"] = rf_cfg is not None
             outcome.report["audit_log_path"] = str(audit.path)
             outcome.report["audit_text_log_path"] = str(audit.text_path)
             outcome.report["audit_aggregate_log_path"] = str(audit.aggregate_path)
@@ -758,25 +918,85 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                      f", {len(unlaunched)} never got a GPU (carried)" if unlaunched else "")
 
             results, sources, curve_data = _build_results(fsm, cloud_sink)
+            refiner_block, refiner_sources = build_refiner_block(
+                fsm, cloud_sink, rf_cfg,
+                scored_status=SubStatus.SCORED, provenance=_eval_provenance)
+            validator._last_refiner_block = refiner_block
+            # Passed to _save_round / _publish_attestation only when there is
+            # one, so the record (and every existing caller) is unchanged otherwise.
+            rf_kw = {"refiner_block": refiner_block} if refiner_block else {}
+            # Published sources = optimizer sources + refiner envelopes. The
+            # frontier (compute_weights) only ever sees the optimizer ones.
+            published_sources = {**sources, **refiner_sources} if refiner_sources else sources
+            if refiner_block:
+                audit_emit(audit, "refiner.results", block=refiner_block)
             confirmations: dict = {}
             confirmation_records: dict = {}
+            rf_confirmations: dict = {}
             if conf_thread is not None:
                 conf_thread.join()
                 confirmations, confirmation_records = _build_confirmations(
                     conf_jobs, conf_verdicts, conf_sink)
+                rf_confirmations, rf_conf_records = _build_refiner_confirmations(
+                    rf_conf_jobs, conf_verdicts, conf_sink, provenance=_eval_provenance)
+                if refiner_block is not None and rf_conf_records:
+                    refiner_block["confirmations"] = rf_conf_records
                 audit_emit(audit, "confirmation.results",
                            results={k: {kk: vv for kk, vv in r.items() if kk != "curves"}
-                                    for k, r in confirmation_records.items()})
+                                    for k, r in confirmation_records.items()},
+                           refiner_results={k: {kk: vv for kk, vv in r.items() if kk != "result"}
+                                            for k, r in rf_conf_records.items()})
             checkpoints = _checkpoint_inventory(curve_data)
             audit_emit(audit, "checkpoints.inventory",
                        count=len(checkpoints), checkpoints=checkpoints)
+            # Burn bootstrap: ALWAYS publish weights, even with zero scored
+            # submissions. compute_weights({}) -> {BURN_KEY: 1.0} routes 100% of
+            # emission to the burn/owner UID, so a fresh subnet with no eligible
+            # miners still burns its emission. Gating weight-setting on `if
+            # results:` (the old behavior) left emission un-set on a no-submission
+            # round, which both fails the configured-to-100% burn path and decays vtrust.
+            # compute_weights promotes its result to validator._last_weights,
+            # which the background epoch refresh re-sets on chain. Snapshot the
+            # previous (already durable) map so a failed save/attestation below
+            # can roll the promotion back — otherwise the refresh thread would
+            # keep pushing weights that never passed the durability gate.
             prev_weights = dict(getattr(validator, "_last_weights", {}) or {})
             try:
                 weights = validator.compute_weights(results, sources=sources, curve_data=curve_data,
                                                     confirmations=confirmations,
                                                     round_id=round_id)
             except TypeError:
+                # Test doubles / older wrappers may still expose the historical
+                # compute_weights(results) signature.
                 weights = validator.compute_weights(results)
+            if refiner_block is not None:
+                # Refiner frontier (Challenge 2): its own bar, confirmation and
+                # progress-scaled pool, blended into the weight vector at the
+                # configured emission share. Replayed by sn125/verify.py from
+                # the block this settles into.
+                now_rf = int(time.time())
+                burn_floor_fn = getattr(validator, "_clamped_burn_fraction_floor", None)
+                frontier = refiner_frontier.settle(
+                    rf_cfg, refiner_block.get("submissions") or {}, rf_confirmations,
+                    rounds_dir=getattr(validator, "rounds_dir", ""), round_id=round_id, now=now_rf,
+                    burn_floor=burn_floor_fn(now_rf) if callable(burn_floor_fn) else 0.0,
+                    launch_timestamp=int(getattr(validator, "launch_timestamp", 0) or 0))
+                refiner_block["frontier"] = frontier
+                weights = refiner_frontier.blend_weights(weights, frontier["weights"], frontier["emission_share"],
+                                                         getattr(validator, "BURN_KEY", refiner_frontier.BURN_KEY))
+                # compute_weights promoted its own map; the blended one is what
+                # goes on chain and what the epoch refresh must re-set.
+                validator._last_weights = dict(weights)
+                audit_emit(audit, "refiner.frontier", round_id=round_id,
+                           frontier={k: v for k, v in frontier.items() if k != "events"})
+                if frontier["new_event"]:
+                    log.info("  refiner frontier: %s confirmed +%.4f suite points (event %s)",
+                             frontier["new_event"]["hotkey"][:16], frontier["new_event"]["improvement"],
+                             frontier["new_event"]["event_id"])
+                if frontier["emission_share"] > 0:
+                    log.info("  refiner pool (%.0f%% of emission): payable %.3f, burned %.3f, bar %.4f",
+                             100 * frontier["emission_share"], frontier["payable_share"],
+                             frontier["burned_share"], frontier["min_improvement_threshold"])
             audit_emit(audit, "weights.computed", weights=weights,
                        scored_hotkeys=sorted(results),
                        frontier_rewards=getattr(validator, "_last_frontier_rewards", {}))
@@ -788,10 +1008,10 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                             "to owner UID (%s)", round_id, mode)
             round_saved = False
             try:
-                validator._save_round(round_id, results, weights, sources, curve_data,
+                validator._save_round(round_id, results, weights, published_sources, curve_data,
                                       pause_reasons=outcome.pause_reasons,
                                       round_report=outcome.report,
-                                      confirmation_records=confirmation_records)
+                                      confirmation_records=confirmation_records, **rf_kw)
                 round_saved = True
                 audit_emit(audit, "round.saved", round_id=round_id,
                            rounds_dir=getattr(validator, "rounds_dir", ""))
@@ -803,9 +1023,9 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
             attestation_ok = False
             try:
                 published = validator._publish_attestation(
-                    round_id, results, weights, sources, curve_data,
+                    round_id, results, weights, published_sources, curve_data,
                     pause_reasons=outcome.pause_reasons,
-                    round_report=outcome.report)
+                    round_report=outcome.report, **rf_kw)
                 attestation_ok = published is not False
                 audit_emit(audit, "attestation.publish_called", round_id=round_id,
                            published=attestation_ok)
@@ -814,6 +1034,10 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                            error=str(e), error_type=type(e).__name__)
                 log.error("  _publish_attestation failed: %s", e)
 
+            # Set the (burn-inclusive) weights on chain every round only after the
+            # round is durable locally and remotely. A live emission write without
+            # a saved/auditable round is harder to reconstruct than skipping a
+            # weight write and retrying next round.
             if getattr(validator, "set_weights_enabled", False):
                 if not round_saved or not attestation_ok:
                     audit_emit(audit, "weights.set_skipped",
@@ -822,6 +1046,9 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                                weights=weights)
                     log.error("  refusing live set_weights: round_saved=%s attestation_ok=%s",
                               round_saved, attestation_ok)
+                    # Roll back the _last_weights promotion so the background
+                    # epoch refresh keeps re-setting the last DURABLE round's
+                    # weights instead of this round's unattested map.
                     try:
                         validator._last_weights = prev_weights
                     except Exception:
@@ -838,12 +1065,16 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                     validator._set_weights_on_chain(meta, weights)
                     audit_emit(audit, "weights.set_on_chain", weights=weights)
         except (RestartNow, KeyboardInterrupt) as e:
+            # Urgent update: the supervisor asked for an immediate restart
+            # (RestartNow from a window wait, or SIGINT while an evaluation
+            # was blocking). The round is abandoned here; its debited credits
+            # are returned by _refund_abandoned_rounds at the next start-up.
             if isinstance(e, KeyboardInterrupt) and not _restart_now_requested(validator):
                 audit_emit(audit, "round.aborted", reason="interrupted by operator",
                            elapsed_s=clock() - round_start)
                 log.warning("  round %s ABANDONED (operator interrupt); credits debited "
                             "in it are returned when the validator starts again", round_id)
-                operator_interrupt = e
+                operator_interrupt = e          # re-raised after the checkpoint below
             else:
                 audit_emit(audit, "round.aborted",
                            reason="immediate restart requested (update)",
@@ -863,9 +1094,14 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
             heartbeat_stop.set()
             audit.close()
             if publisher is not None:
+                # Round boundary: sync the freshly closed audit/round files now
+                # instead of waiting out the cadence timer.
                 publisher.publish_now()
             round_num += 1
             rounds_this_process += 1
+            # Round boundary = the one lossless restart point. Checkpoint the
+            # inter-round state first, then honour a pending restart request,
+            # then sleep to the 24h boundary (re-checking the request as we go).
             if state_path is not None:
                 try:
                     save_loop_state(state_path, round_num=round_num, carryover=carryover,
@@ -876,23 +1112,34 @@ def run_fsm_validator(validator, *, max_rounds: int | None = None,
                     log.error("  could not checkpoint validator state to %s: %s",
                               state_path, e)
             if restart_reason is not None or operator_interrupt is not None:
-                pass
+                pass                                  # abandoned round: leave now
             elif _restart_requested(validator):
                 restart_reason = "restart"
             elif nothing_launched:
+                # No GPU for the whole launch window and nothing ran: the ~20h
+                # evaluation budget was never spent, so waiting out the rest of
+                # the period would only keep the carried commits idle. Open the
+                # next round (and its launch window) now — that is how sporadic
+                # capacity gets picked up: a fresh window every few hours until
+                # a box is found or the carry limit refunds the credit.
                 log.info("  no GPU during the launch window; opening the next round now "
                          "(%d carried commit(s) keep their credits and priority)",
                          len(carryover))
             else:
-                remaining = round_period_s - (clock() - round_start)
+                # The commit/reveal windows + the ~20h eval already consume most
+                # of the period; this just tops up to the boundary: the next
+                # grid line (config.next_round_start) or, without a grid, the
+                # period after this round's start.
+                next_start = next_round_start(round_start, clock(), round_period_s, grid_anchor)
+                remaining = next_start - clock()
                 if remaining > 0:
-                    log.info("  next round in %.0fs", remaining)
+                    log.info("  next round in %.0fs (%s)", remaining, _utc(next_start))
                 while remaining > 0:
                     sleep(min(remaining, _BOUNDARY_POLL_S))
                     if _restart_requested(validator):
                         restart_reason = "restart"
                         break
-                    remaining = round_period_s - (clock() - round_start)
+                    remaining = next_start - clock()
         if operator_interrupt is not None:
             _stop_background(weight_refresh_stop, payment_watch_stop, publisher)
             raise operator_interrupt
@@ -940,6 +1187,34 @@ def _restart_flag_path(validator) -> Path | None:
     return Path(configured) if configured else None
 
 
+def _refiner_cfg_for_round(validator, round_start: float):
+    """The refiner config in force for a round opening at ``round_start``: the
+    validator's, or None before the Challenge-2 start instant
+    (``validator.refiner_start_timestamp``, config.REFINER_START_TIMESTAMP)."""
+    cfg = getattr(validator, "_refiner_cfg", None)
+    start = int(getattr(validator, "refiner_start_timestamp", 0) or 0)
+    if cfg is None or float(round_start) >= start:
+        return cfg
+    return None
+
+
+def _utc(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(float(ts)))
+
+
+def _chain_block(validator) -> int | None:
+    """Current chain block for the round record's audit trail, None when the
+    validator has no chain connection (dry run, tests)."""
+    sub = getattr(validator, "subtensor", None)
+    if sub is None:
+        return None
+    try:
+        return int(sub.get_current_block())
+    except Exception as e:
+        log.debug("chain block unavailable: %s", e)
+        return None
+
+
 def _restart_requested(validator) -> bool:
     """True when the supervisor has asked for a restart at the next safe point."""
     if bool(getattr(validator, "restart_requested", False)):
@@ -975,6 +1250,9 @@ class RestartNow(Exception):
     """Raised inside a round when an immediate restart was requested."""
 
 
+# Audit events that settle a commit's credit for good inside a round: a
+# miner-fault outcome burns the credit by rule, so an abandoned round must
+# not hand it back.
 _BURNED_EVENTS = ("gate.dq", "submission.unrevealed")
 _SETTLED_EVENTS = ("round.published", "round.saved", "weights.computed")
 
@@ -1002,7 +1280,7 @@ def _audit_round_status(audit_dir: Path, round_id: str) -> tuple[bool | None, se
                 elif (ev == "evaluation.finalized" and rec.get("hotkey")
                       and rec.get("status") in (SubStatus.DQ.value,
                                                 SubStatus.EXPIRED.value)):
-                    burned.add(str(rec["hotkey"]))
+                    burned.add(str(rec["hotkey"]))       # miner-fault DQ / expired: consumed
     except OSError:
         pass
     return settled, burned
@@ -1014,7 +1292,7 @@ RECONCILIATION_FILE = "payments_reconciliation.jsonl"
 
 def _software_version() -> str:
     try:
-        from ..neuron import SN125_VERSION
+        from ..neuron import SN125_VERSION   # lazy: neuron imports this module
         return str(SN125_VERSION)
     except Exception:
         return "unknown"
@@ -1129,9 +1407,9 @@ def _refund_no_gpu_dqs(validator, reg) -> int:
     except TypeError:
         return 0
     audit_dir = _audit_dir_for(validator)
-    debited: dict[tuple[str, str, str], int] = {}
+    debited: dict[tuple[str, str, str], int] = {}     # (round, coldkey, hotkey) -> debits
     refunded_for: dict[tuple[str, str, str], int] = {}
-    refunds_untagged: dict[tuple[str, str], int] = {}
+    refunds_untagged: dict[tuple[str, str], int] = {}  # (round, coldkey) -> hotkey-less refunds
     rounds: set[str] = set()
     for ev in events:
         if not ev.round_id or ev.coldkey is None:
@@ -1151,6 +1429,8 @@ def _refund_no_gpu_dqs(validator, reg) -> int:
             owed = debited.get(key, 0) - refunded_for.get(key, 0)
             if owed <= 0:
                 continue
+            # A hotkey-less refund in the same round for this coldkey (older
+            # infra-DQ refunds) may already cover it; consume those first.
             spare = refunds_untagged.get((round_id, coldkey), 0)
             if spare > 0:
                 refunds_untagged[(round_id, coldkey)] = spare - 1
@@ -1160,7 +1440,7 @@ def _refund_no_gpu_dqs(validator, reg) -> int:
                        f"{NO_GPU_RESTITUTION_TAG} {hotkey}: recorded as miner-fault DQ "
                        f"but no GPU was rented ({reason[:120]}); credit returned",
                        hotkey=hotkey)
-            except TypeError:
+            except TypeError:     # registry without the hotkey keyword
                 refund(coldkey, round_id,
                        f"{NO_GPU_RESTITUTION_TAG} {hotkey}: recorded as miner-fault DQ "
                        f"but no GPU was rented ({reason[:120]}); credit returned")
@@ -1207,7 +1487,7 @@ def _refund_abandoned_rounds(validator, reg) -> int:
     refunded = 0
     for round_id, evs in sorted(by_round.items()):
         if rounds_dir and (rounds_dir / f"{round_id}.json").exists():
-            continue
+            continue                               # published: outcomes are final
         settled, burned = _audit_round_status(audit_dir, round_id)
         if settled is None or settled:
             continue
@@ -1293,6 +1573,7 @@ def _start_payment_watcher(validator, reg, fee_rao: int):
                  "start-up, %d funded coldkey(s), %d credit(s) outstanding",
                  granted, len(balances), sum(balances.values()))
     except Exception as e:
+        # The watcher below retries; the round loop must still start.
         log.error("  start-up payment catch-up failed (watcher will retry): %s", e)
     interval = _payment_scan_interval(validator)
     if interval <= 0:
@@ -1309,6 +1590,9 @@ def _start_artifact_publisher(validator):
     R2 + private HF). Best-effort by design: publishing must never affect the
     round loop, so construction/start failures degrade to a warning."""
     if str(getattr(validator, "network", "") or "").lower() == "mock":
+        # Dry-runs (`validate --mock`, tests) must never mirror their synthetic
+        # rounds into the operator's real bucket: cloud.py loads .env at import,
+        # so os.environ carries live R2 credentials even in a test process.
         log.info("continuous artifact publisher disabled for the mock network")
         return None
     try:

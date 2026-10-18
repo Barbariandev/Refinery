@@ -74,8 +74,8 @@ from typing import Callable, Sequence
 
 log = logging.getLogger("sn125.autoupdate")
 
-EXIT_RESTART = 75
-RESTART_FLAG_ENV = "SN125_RESTART_FLAG"
+EXIT_RESTART = 75                       # mirrors roundsm.live.EXIT_RESTART
+RESTART_FLAG_ENV = "SN125_RESTART_FLAG"  # mirrors roundsm.live.RESTART_FLAG_ENV
 
 DEFAULT_INTERVAL_S = 300.0
 INTERVAL_ENV = "SN125_UPDATE_INTERVAL_S"
@@ -90,13 +90,14 @@ SUPERVISOR_FLAGS = ("--auto-update", "--update-interval")
 _CRASH_BACKOFF_MIN_S = 30.0
 _CRASH_BACKOFF_MAX_S = 600.0
 
+# Urgent ("update now") protocol
 UPDATE_NOW_FILE = "UPDATE_NOW"
 UPDATE_NOW_TAG = "[update-now]"
-RESTART_NOW_MARKER = "now"
+RESTART_NOW_MARKER = "now"               # mirrors roundsm.live.RESTART_NOW_MARKER
 NOW_GRACE_ENV = "SN125_UPDATE_NOW_GRACE_S"
 DEFAULT_NOW_GRACE_S = 120.0
-_NOW_TERM_AFTER_S = 60.0
-_NOW_KILL_AFTER_S = 30.0
+_NOW_TERM_AFTER_S = 60.0                 # SIGTERM this long after SIGINT
+_NOW_KILL_AFTER_S = 30.0                 # SIGKILL this long after SIGTERM
 _SMOKE_MODULES = ("sn125.__main__", "sn125.roundsm.live", "sn125.autoupdate")
 
 
@@ -147,6 +148,7 @@ def audit_dir_from_argv(argv: Sequence[str], root: str | Path | None = None) -> 
     return Path(root or repo_root()) / "sn125" / "audit"
 
 
+# -- git ----------------------------------------------------------------------
 
 class Repo:
     """Thin git wrapper over one working tree."""
@@ -156,13 +158,15 @@ class Repo:
 
     @staticmethod
     def _env() -> dict[str, str]:
+        # ``git stash`` writes commits and needs an identity; servers rarely
+        # have one configured. Only fill in what the operator left unset.
         env = dict(os.environ)
         for key, value in (("GIT_AUTHOR_NAME", "sn125-autoupdate"),
                            ("GIT_AUTHOR_EMAIL", "autoupdate@sn125.invalid"),
                            ("GIT_COMMITTER_NAME", "sn125-autoupdate"),
                            ("GIT_COMMITTER_EMAIL", "autoupdate@sn125.invalid")):
             env.setdefault(key, value)
-        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")   # never hang on a credential prompt
         return env
 
     def git(self, *args: str, check: bool = True) -> str:
@@ -195,6 +199,8 @@ class Repo:
 
     def modified_tracked(self) -> list[str]:
         """Tracked paths with uncommitted changes (worktree or index)."""
+        # -z: NUL-separated, no quoting; entries are "XY path" (renames add a
+        # second NUL-terminated field, which is the ORIGINAL path — skipped).
         proc = subprocess.run(["git", "-C", str(self.root), "status", "--porcelain",
                                "-z", "--untracked-files=no"],
                               capture_output=True, env=self._env())
@@ -210,7 +216,7 @@ class Repo:
                 continue
             status, path = entry[:2], entry[3:]
             if "R" in status or "C" in status:
-                i += 1
+                i += 1          # skip the rename/copy source field
             if status.strip():
                 paths.append(path)
         return paths
@@ -267,6 +273,9 @@ def checkout_keeping(repo: Repo, target: str, keep: Sequence[str],
     protected = [p for p in keep if p in modified]
     unprotected = sorted(modified - set(protected))
     if unprotected:
+        # Not in the keep list: the operator did not ask for these edits to
+        # survive updates. Back them up rather than lose them, then let the
+        # reset replace them (they would otherwise block every update).
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         dest = _backup(repo, unprotected, backup_root, f"{stamp}-{repo.short(repo.head())}-unlisted")
         log.warning("locally modified tracked files not in %s will be replaced by the "
@@ -290,6 +299,8 @@ def checkout_keeping(repo: Repo, target: str, keep: Sequence[str],
         if popped.returncode == 0:
             kept = list(protected)
         else:
+            # Conflict: keep upstream's version for the operator, then restore
+            # the operator's full file and drop the stash.
             for rel in protected:
                 try:
                     upstream_text = repo.git("show", f"{target}:{rel}")
@@ -300,6 +311,8 @@ def checkout_keeping(repo: Repo, target: str, keep: Sequence[str],
                     up_copy.parent.mkdir(parents=True, exist_ok=True)
                     up_copy.write_text(upstream_text + "\n", encoding="utf-8")
                 repo.git("checkout", "stash@{0}", "--", rel)
+                # ``checkout <tree> -- path`` stages the file; unstage so the
+                # worktree shows a plain local modification again.
                 repo.git("reset", "--quiet", "--", rel, check=False)
             repo.git("stash", "drop", "--quiet", check=False)
             conflicts = list(protected)
@@ -358,6 +371,7 @@ def apply_update(repo: Repo, target: str, *, keep: Sequence[str] = DEFAULT_KEEP,
     return result
 
 
+# -- supervisor ----------------------------------------------------------------
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -407,12 +421,13 @@ class Supervisor:
         self._proc: subprocess.Popen | None = None
         self._stopping = False
         self._pending: str | None = None
-        self._pending_now = False
+        self._pending_now = False           # the pending update is urgent
         self._now_requested_at: float | None = None
         self._now_signals_sent = 0
         self._last_fetch = 0.0
         self._fetch_failures = 0
 
+    # -- update detection ---------------------------------------------------
     def _branch(self) -> str:
         return self.branch or self.repo.branch()
 
@@ -446,6 +461,7 @@ class Supervisor:
                       self.repo.short(result.new), result.message)
         return result
 
+    # -- child ----------------------------------------------------------------
     def _spawn(self) -> subprocess.Popen:
         env = {**os.environ, RESTART_FLAG_ENV: str(self.flag)}
         cmd = [*self.child_cmd, *self.child_argv]
@@ -532,6 +548,7 @@ class Supervisor:
         result = self.apply(target)
         return result.ok
 
+    # -- main loop --------------------------------------------------------------
     def run(self, install_signal_handlers: bool = True) -> int:
         if not self.repo.is_repo():
             log.error("%s is not a git checkout; --auto-update needs a clone of the "
@@ -553,7 +570,7 @@ class Supervisor:
                 if self.self_exec is not None:
                     log.info("re-executing the supervisor on the updated code")
                     self.self_exec()
-                    return 0
+                    return 0  # only reached when self_exec returns (tests)
             self._pending = None
             self._pending_now = False
             self._now_requested_at = None
@@ -568,6 +585,7 @@ class Supervisor:
                 backoff = _CRASH_BACKOFF_MIN_S
                 continue
             if self._pending_now and not self._stopping:
+                # We asked for (and possibly forced) this exit; not a crash.
                 log.warning("validator exited with %s after the urgent request; "
                             "applying the update and restarting now", rc)
                 backoff = _CRASH_BACKOFF_MIN_S
@@ -616,10 +634,13 @@ def supervise(full_argv: Sequence[str], *, interval_s: float | None = None) -> i
     child_argv = strip_supervisor_flags(full_argv)
     root = repo_root()
     program = [sys.executable, "-m", "sn125", *full_argv]
+    # The supervisor's own log goes next to the validator's audit trail so the
+    # continuous publisher mirrors it (audit/autoupdate.log): an operator can
+    # see from R2 alone which commit is running and when updates were applied.
     try:
         from .logfile import attach_rotating_log
         attach_rotating_log(audit_dir_from_argv(child_argv, root) / "autoupdate.log")
-    except Exception as exc:
+    except Exception as exc:  # logging convenience must never block supervision
         log.warning("supervisor file log unavailable: %s", exc)
 
     def self_exec() -> None:

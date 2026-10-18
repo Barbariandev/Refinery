@@ -1,13 +1,13 @@
-"""Paper-1 provenance: build the Refinery progression record from round JSONs.
+"""Progression record: build the Refinery progression record from round JSONs.
 
-The first Refinery publication documents the *progression over time* — what the
+The record documents the *progression over time* — what the
 miner network tried, what beat the baseline, when the frontier moved, and what
 was burned versus paid. All of that already lives in the per-round JSONs the
 validator writes (and the publisher mirrors to R2/HF). This module distills
 those files into two figure-ready artifacts, with zero operator steps:
 
 - a machine-readable ``progression.json`` (per-round series + frontier
-  timeline + per-code-hash provenance), the data behind every paper figure;
+  timeline + per-code-hash provenance), the data behind the progression figures;
 - a human-readable Markdown summary for the repo/appendix.
 
 Deliberately tolerant: round files from crashed/partial rounds, foreign JSON
@@ -135,11 +135,12 @@ def round_summary(rd: dict) -> dict:
 
 
 def build_progression(rounds: list[dict]) -> dict:
-    """The full paper-1 record: per-round series, frontier timeline, provenance."""
+    """The full progression record: per-round series, frontier timeline, provenance."""
     series = [round_summary(rd) for rd in rounds]
 
     frontier = [r["new_frontier_event"] for r in series if r["new_frontier_event"]]
 
+    # Per-code-hash provenance: first/last seen, submitting hotkeys, best result.
     provenance: dict[str, dict] = {}
     for rd, row in zip(rounds, series):
         for hk, entry in (rd.get("submissions") or {}).items():
@@ -162,6 +163,8 @@ def build_progression(rounds: list[dict]) -> dict:
             except (TypeError, ValueError):
                 pass
 
+    # Best-loss trajectory (per task): the headline figure — baseline vs
+    # the running best submission loss over time.
     trajectory: dict[str, list] = {}
     running_best: dict[str, float] = {}
     for row in series:
@@ -222,7 +225,7 @@ def to_markdown(progression: dict) -> str:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Build the Refinery paper-1 progression record")
+    ap = argparse.ArgumentParser(description="Build the Refinery progression record")
     ap.add_argument("--rounds-dir", default="", help="round JSON dir (default: sn125/rounds)")
     ap.add_argument("--out", default="", help="write progression JSON here")
     ap.add_argument("--markdown", default="", help="write Markdown summary here")

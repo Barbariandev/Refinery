@@ -57,17 +57,19 @@ class Phase(Enum):
 
 class SubStatus(Enum):
     COMMITTED = "committed"
-    UNREVEALED = "unrevealed"
+    UNREVEALED = "unrevealed"      # consumed the credit, never revealed (E4)
     REVEALED = "revealed"
     RUNNING = "running"
     SCORED = "scored"
-    DQ = "dq"
-    INFRA_DQ = "infra_dq"
-    DEFERRED = "deferred"
-    EXPIRED = "expired"
+    DQ = "dq"                      # miner-fault DQ: fee burned
+    INFRA_DQ = "infra_dq"          # our-fault DQ: credit refunded (§2.4)
+    DEFERRED = "deferred"          # >8 overflow: credit RETAINED, FIFO rollover (§6.2)
+    EXPIRED = "expired"            # carried 30 rounds / 30 days without a GPU: credit absorbed
 
     @property
     def terminal(self) -> bool:
+        # DEFERRED is terminal *for this round* (publish proceeds) but the credit
+        # is retained — the validator loop re-queues the commitment next round.
         return self in (SubStatus.UNREVEALED, SubStatus.SCORED,
                         SubStatus.DQ, SubStatus.INFRA_DQ, SubStatus.DEFERRED,
                         SubStatus.EXPIRED)
@@ -77,18 +79,18 @@ class SubStatus(Enum):
 class RoundConfig:
     """Pinned, published per round (dashboard §9.1 'round config')."""
     round_id: str
-    scale: str
+    scale: str                 # e.g. "1.7B"
     horizon_steps: int
-    task_family: str
-    gpu_sku: str
-    fee_rao: int
+    task_family: str           # e.g. "fineweb-edu"
+    gpu_sku: str               # e.g. "h200-small" (C5: SKU pinned per round)
+    fee_rao: int               # TAO fee pin for this round window
     commit_window_s: float
     reveal_window_s: float
 
 
 @dataclass
 class Submission:
-    commit_hash: str
+    commit_hash: str           # sha256 hex of the reveal payload
     hotkey: str
     coldkey: str
     status: SubStatus = SubStatus.COMMITTED
@@ -98,7 +100,7 @@ class Submission:
     crashes: int = 0
     relaunched: bool = False
     score: float | None = None
-    deferrals: int = 0
+    deferrals: int = 0         # rounds rolled over un-evaluated (§6.2 FIFO age)
     selected_for_eval: bool = False
     selection_rank: int | None = None
     forensics: list[str] = field(default_factory=list)
@@ -108,10 +110,23 @@ def commit_hash_of(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+# Consecutive provisioning flakes that constitute an outage (§2.4).
 OUTAGE_FLAKE_STREAK = 3
+# A paid commit the validator could not START evaluating (no GPU inside the
+# round's launch window) is carried to the next round with its credit and FIFO
+# priority, round after round, until it runs. A commit still unevaluated after
+# BOTH of these — it has been carried this many rounds AND this much time has
+# passed since it was accepted — is EXPIRED: the credit is absorbed (not
+# refunded, not burned as miner fault). Rounds are nominally daily, so the two
+# limits normally coincide; the time floor stops fast no-GPU cycles (a round
+# that launches nothing opens the next one at once) from expiring a commit
+# early, and the round floor stops a long pause from expiring it in one step.
 MAX_UNLAUNCHED_DEFERRALS = 30
 UNLAUNCHED_MAX_AGE_S = 30 * 24 * 3600.0
 
+# Max submissions evaluated concurrently per round (§6.2). Mirrors
+# cloud.MAX_CONCURRENT (the Targon rental cap); kept local to avoid importing
+# the heavy cloud module into the FSM. test_round_fsm asserts they stay equal.
 MAX_EVAL_PER_ROUND = 8
 
 
@@ -132,6 +147,7 @@ class RoundFSM:
         self._selected = False
         self._accept_seq = 0
 
+    # -- phase plumbing ----------------------------------------------------
     def _require(self, *phases: Phase) -> None:
         if self.phase not in phases:
             raise PhaseError(
@@ -156,6 +172,7 @@ class RoundFSM:
             return None
         return self._phase_started_at + window + self._paused_in_phase
 
+    # -- commit window -------------------------------------------------------
     def open_commits(self) -> None:
         self._require(Phase.SETUP)
         pinned = self.registry.fee_for_round(self.config.round_id)
@@ -170,11 +187,11 @@ class RoundFSM:
         """Credit-gated (E4): debits 1 credit from the hotkey's coldkey NOW."""
         self._require(Phase.COMMIT_OPEN)
         if commit_hash in self.submissions:
-            raise RoundError("duplicate commit hash")
+            raise RoundError("duplicate commit hash")  # E5: copies are useless
         try:
             coldkey = self.registry.debit_for_commit(hotkey, self.config.round_id,
                                                      commit_hash=commit_hash)
-        except TypeError:
+        except TypeError:   # registry without the commit_hash keyword
             coldkey = self.registry.debit_for_commit(hotkey, self.config.round_id)
         self._accept_seq += 1
         sub = Submission(
@@ -193,6 +210,7 @@ class RoundFSM:
             raise RoundError("commit window not over (pause-extended deadline)")
         self._enter(Phase.REVEAL_OPEN)
 
+    # -- reveal window ---------------------------------------------------------
     def reveal(self, commit_hash: str, payload: bytes) -> Submission:
         self._require(Phase.REVEAL_OPEN)
         sub = self.submissions.get(commit_hash)
@@ -212,10 +230,11 @@ class RoundFSM:
             raise RoundError("reveal window not over (pause-extended deadline)")
         for sub in self.submissions.values():
             if sub.status is SubStatus.COMMITTED:
-                sub.status = SubStatus.UNREVEALED
+                sub.status = SubStatus.UNREVEALED   # consumed; no refund (E4)
                 sub.forensics.append("never revealed; credit consumed")
         self._enter(Phase.EVALUATING)
 
+    # -- selection (§6.2: >8 valid commits) ---------------------------------
     def select_for_evaluation(self, *, recent_hotkeys=(),
                               max_eval: int = MAX_EVAL_PER_ROUND
                               ) -> tuple[list[str], list[str]]:
@@ -287,6 +306,7 @@ class RoundFSM:
         self.submissions[sub.commit_hash] = sub
         return sub
 
+    # -- evaluation (§2.4 adversity rules) ----------------------------------
     def start_run(self, commit_hash: str) -> None:
         self._require(Phase.EVALUATING)
         sub = self._eval_sub(commit_hash, SubStatus.REVEALED)
@@ -389,6 +409,7 @@ class RoundFSM:
                              f"{'/'.join(s.value for s in statuses)}")
         return sub
 
+    # -- pause gates (§2.4) ---------------------------------------------------
     def pause(self, reason: str) -> None:
         if self.phase in (Phase.PAUSED, Phase.PUBLISHED, Phase.SETUP):
             raise PhaseError(f"cannot pause from {self.phase.value}")
@@ -405,6 +426,7 @@ class RoundFSM:
         self._resume_phase = None
         self._flake_streak = 0
 
+    # -- publish ------------------------------------------------------------
     def publish(self) -> dict:
         """All revealed work terminal -> PUBLISHED; returns the round report
         (dashboard §9.1: config, per-submission lifecycle, forensics)."""

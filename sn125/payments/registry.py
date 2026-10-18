@@ -131,6 +131,7 @@ class MockChain:
     def advance_blocks(self, n: int = 1) -> None:
         self.head += n
 
+    # -- ChainView --
     def finalized_transfers_to_treasury(self, since_block: int) -> list[Transfer]:
         cutoff = self.head - self.finality_depth
         return sorted(
@@ -146,15 +147,15 @@ class MockChain:
 class LedgerEvent:
     """One append-only ledger entry. The published ledger is exactly these."""
     seq: int
-    kind: str
+    kind: str               # "fee_pin" | "grant" | "debit" | "refund"
     round_id: str | None
     coldkey: str | None
-    credits: int
-    rao: int
+    credits: int            # signed credit delta for this coldkey
+    rao: int                # TAO amount involved (transfer size / fee pin)
     tx_id: str | None
-    hotkey: str | None
+    hotkey: str | None      # debiting hotkey (kind == "debit")
     note: str
-    carry_rao: int = 0
+    carry_rao: int = 0      # coldkey's unspent rao remainder AFTER this grant
 
 
 class PaymentRegistry:
@@ -166,12 +167,12 @@ class PaymentRegistry:
 
     def __init__(self, chain: ChainView, store_path: str | Path | None = None) -> None:
         self._chain = chain
-        self._lock = threading.RLock()
-        self._sync_lock = threading.Lock()
+        self._lock = threading.RLock()      # guards every field below
+        self._sync_lock = threading.Lock()  # serializes chain scans
         self._store_path = Path(store_path) if store_path else None
         self._events: list[LedgerEvent] = []
         self._balances: dict[str, int] = {}
-        self._carry: dict[str, int] = {}
+        self._carry: dict[str, int] = {}    # coldkey -> unspent rao (< one fee)
         self._seen_tx: set[str] = set()
         self._last_block = -1
         self._fee_rao: int | None = None
@@ -179,6 +180,7 @@ class PaymentRegistry:
         if self._store_path is not None:
             self._load()
 
+    # -- introspection ------------------------------------------------------
     @property
     def store_path(self) -> Path | None:
         return self._store_path
@@ -195,6 +197,7 @@ class PaymentRegistry:
         with self._lock:
             return self._last_block
 
+    # -- fee pin ----------------------------------------------------------
     def pin_fee(self, round_id: str, fee_rao: int) -> None:
         """Pin the TAO fee for a round. One pin per round, ever (§8)."""
         if fee_rao <= 0:
@@ -236,6 +239,7 @@ class PaymentRegistry:
         with self._lock:
             return self._pinned_rounds.get(round_id)
 
+    # -- chain sync (grants) ----------------------------------------------
     def sync(self) -> int:
         """Process newly finalized treasury transfers; returns count processed.
 
@@ -252,6 +256,8 @@ class PaymentRegistry:
             cursor_before = self._chain_cursor()
             transfers = self._chain.finalized_transfers_to_treasury(since)
             if not transfers:
+                # Cursor may have advanced over empty blocks: persist it so a
+                # restart does not re-read (or, past the prune window, lose) them.
                 self._persist_cursor_only(cursor_before)
                 return 0
             with self._lock:
@@ -328,6 +334,7 @@ class PaymentRegistry:
             n += 1
         return n
 
+    # -- balances / resolution ----------------------------------------------
     def balance(self, coldkey: str) -> int:
         with self._lock:
             return self._balances.get(coldkey, 0)
@@ -353,6 +360,7 @@ class PaymentRegistry:
             raise UnknownHotkeyError(f"hotkey {hotkey!r} not on metagraph")
         return coldkey
 
+    # -- debit / refund -----------------------------------------------------
     def debit_for_commit(self, hotkey: str, round_id: str,
                          commit_hash: str | None = None) -> str:
         """Debit 1 credit from the hotkey's coldkey; returns the coldkey. The
@@ -389,6 +397,7 @@ class PaymentRegistry:
 
             self._transaction(apply)
 
+    # -- audit surface --------------------------------------------------------
     @property
     def events(self) -> tuple[LedgerEvent, ...]:
         with self._lock:
@@ -416,6 +425,7 @@ class PaymentRegistry:
                 carry[e.coldkey] = e.carry_rao
         return {k: v for k, v in carry.items() if v}
 
+    # -- internals ------------------------------------------------------------
     def _append(self, kind: str, *, round_id: str | None = None,
                 coldkey: str | None = None, credits: int = 0, rao: int = 0,
                 tx_id: str | None = None, hotkey: str | None = None,
@@ -442,6 +452,7 @@ class PaymentRegistry:
              self._last_block, self._fee_rao, self._pinned_rounds) = saved
             raise
 
+    # chain scan cursor (optional on the ChainView; BittensorChainView has it)
     def _chain_cursor(self) -> int | None:
         getter = getattr(self._chain, "scan_cursor", None)
         if getter is None:
@@ -457,7 +468,7 @@ class PaymentRegistry:
             return
         try:
             setter(cursor)
-        except Exception as e:
+        except Exception as e:  # never let cursor bookkeeping mask the real error
             log.warning("could not roll back payment scan cursor to %s: %s", cursor, e)
 
     def _persist_cursor_only(self, cursor_before: int | None) -> None:
@@ -470,6 +481,7 @@ class PaymentRegistry:
             try:
                 self._persist()
             except Exception as e:
+                # Not fatal: the next grant/debit snapshot carries the cursor.
                 log.warning("payment ledger cursor checkpoint failed: %s", e)
 
     def _snapshot(self) -> dict:
@@ -524,7 +536,7 @@ class PaymentRegistry:
                 f"payment ledger {self._store_path}: stored balances do not match "
                 f"the replayed event log (stored={stored}, replayed={replayed})")
         replayed_carry = self.replay_carry(events)
-        if "carry_rao" in data:
+        if "carry_rao" in data:   # absent on ledgers written before carry existed
             try:
                 stored_carry = {str(k): int(v) for k, v in (data["carry_rao"] or {}).items()
                                 if int(v)}

@@ -222,4 +222,5 @@ def audit_emit(audit: Any, event: str, **fields: Any) -> None:
     try:
         audit.emit(event, **fields)
     except Exception:
+        # Audit logging must never change protocol behavior.
         pass

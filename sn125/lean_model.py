@@ -51,12 +51,22 @@ class LeanConfig:
     rms_norm_eps: float = 1e-5
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
+    # Fused chunked LM-head+CE: number of sequence-position tiles for the loss so the
+    # full (B*S, vocab) logits is never materialized. 0/1 = single block (HF-equivalent
+    # peak); >1 bounds the fp32 logits to one tile. Set per-run via SN125_LEAN_LOSS_CHUNKS.
     loss_chunks: int = 8
+    # Activation-checkpoint each CE tile during training: recomputes the tile's
+    # LM-head forward in backward, bounding live fp32 logits to ONE tile (needed on
+    # memory-tight boxes) at ~4-5% extra step FLOPs. On production B200-180GB the
+    # full 8-tile working set (~13GB fp32) fits trivially, so the recompute is pure
+    # waste there — disable via SN125_LEAN_LOSS_CKPT=0. Numerically identical either
+    # way (checkpointing replays the same kernels; it never changes values).
     loss_ckpt: bool = True
 
 
+# SmolLM2-family shapes, inline (no HF config fetch).
 LEAN_CONFIGS = {
-    "lean-llama-360m": LeanConfig(),
+    "lean-llama-360m": LeanConfig(),  # ≈ SmolLM2-360M
     "lean-llama-135m": LeanConfig(hidden_size=576, intermediate_size=1536,
                                   num_hidden_layers=30, num_attention_heads=9,
                                   num_key_value_heads=3),
@@ -79,8 +89,8 @@ class RMSNorm(nn.Module):
 def _rope_cache(seq_len: int, head_dim: int, theta: float, device, dtype):
     inv = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     t = torch.arange(seq_len, device=device).float()
-    freqs = torch.outer(t, inv)
-    emb = torch.cat((freqs, freqs), dim=-1)
+    freqs = torch.outer(t, inv)  # (S, head_dim/2)
+    emb = torch.cat((freqs, freqs), dim=-1)  # (S, head_dim)
     return emb.cos().to(dtype), emb.sin().to(dtype)
 
 
@@ -90,6 +100,7 @@ def _rotate_half(x):
 
 
 def _apply_rope(q, k, cos, sin):
+    # q,k: (B, H, S, D); cos,sin: (S, D)
     cos = cos[None, None, :, :]
     sin = sin[None, None, :, :]
     return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
@@ -113,6 +124,8 @@ class Attention(nn.Module):
         k = self.k_proj(x).view(B, S, self.nkv, self.hd).transpose(1, 2)
         v = self.v_proj(x).view(B, S, self.nkv, self.hd).transpose(1, 2)
         q, k = _apply_rope(q, k, cos, sin)
+        # Keep K/V in true GQA form. repeat_interleave expands K/V by nh/nkv
+        # before attention, which partially defeats GQA's memory win at seq2048.
         if self.rep > 1:
             o = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         else:
@@ -163,12 +176,17 @@ class LeanLlama(nn.Module):
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self._grad_ckpt = False
         self.uses_fused_lm_head_ce = True
+        # RoPE tables precomputed for the full max_position window (fp32, ~4MB at
+        # 8192x64x2). Built at init and SLICED per-forward: no lazy state mutation
+        # inside forward, which torch.compile needs (a lazily-written buffer both
+        # graph-breaks dynamo and corrupts cudagraph replay under max-autotune).
+        # fp32 matches the old lazy cache dtype (x is fp32 pre-autocast) exactly.
         _cos, _sin = _rope_cache(cfg.max_position_embeddings,
                                  cfg.hidden_size // cfg.num_attention_heads,
                                  cfg.rope_theta, "cpu", torch.float32)
         self.register_buffer("_rope_cos", _cos, persistent=False)
         self.register_buffer("_rope_sin", _sin, persistent=False)
-        self.apply(self._init)
+        self.apply(self._init)  # deterministic under the caller's manual_seed
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
@@ -186,6 +204,9 @@ class LeanLlama(nn.Module):
         self._grad_ckpt = False
 
     def _get_rope(self, seq_len: int, head_dim: int, device, dtype):
+        # Slice the precomputed table; .to(dtype) is an identity no-op for the
+        # fp32 production path, and matches the old lazy-cache dtype for models
+        # converted wholesale to bf16.
         return (self._rope_cos[:seq_len].to(dtype),
                 self._rope_sin[:seq_len].to(dtype))
 
@@ -201,10 +222,17 @@ class LeanLlama(nn.Module):
                 x = blk(x, cos, sin)
         return self.norm(x)
 
-    def forward(self, input_ids, labels=None):
+    def forward(self, input_ids, labels=None, weights=None):
         h = self._backbone(input_ids)
+        if weights is not None:
+            return _Out(loss=self._weighted_loss_from_hidden(h, input_ids, weights))
         if labels is None:
             return _Out(logits=self.lm_head(h))
+        # Fused chunked LM-head + cross-entropy: tile over positions so the full
+        # (B*S, vocab) logits + fp32 cast is never materialized. Flatten the full
+        # hidden-state tensor as a view and ignore each sequence's final position;
+        # slicing h[:, :-1] would force a hidden-state copy because the batch stride
+        # still includes the dropped token.
         B, S, H = h.shape
         hs = h.reshape(-1, H)
         ys2 = labels.new_full((B, S), -100)
@@ -218,6 +246,8 @@ class LeanLlama(nn.Module):
         w = self.lm_head.weight
 
         def _chunk_loss(hc, yc):
+            # fp32 logits for ONE tile only; checkpoint frees it after forward and
+            # recomputes in backward → peak logits memory bounded to a single tile.
             return F.cross_entropy(F.linear(hc, w).float(), yc,
                                    ignore_index=-100, reduction="sum")
 
@@ -231,6 +261,78 @@ class LeanLlama(nn.Module):
                 s = _chunk_loss(hc, yc)
             total = total + s
         return _Out(loss=total / max(1, count))
+
+    # ── Refiner task primitives (docs/REFINER_TASK.md) ────────────────────────
+    # Selective language modelling: every token is READ (it is in the input and
+    # shapes every later position's representation) but only positions with a
+    # nonzero weight produce a gradient. ``weights`` is aligned with ``input_ids``
+    # and means "how much to learn from predicting THIS token"; position 0 has no
+    # prediction and its weight is ignored. loss = sum_t w_t * ce_t / sum_t w_t
+    # (scale-free in w).
+    # The weighted loss is a branch of ``forward`` and runs over ALL positions
+    # with static shapes, exactly like the uniform path (same tiling, same
+    # checkpointing): that is what lets torch.compile cover it. A separate
+    # method that gathered only the selected positions ran EAGER under
+    # SN125_LEAN_COMPILE (Module.compile() wraps forward only) — 1.8 steps/s on a
+    # B200 against 3.4 for the compiled uniform path — and its data-dependent
+    # shapes could not be compiled. The price: a zero-weight token costs the
+    # same head FLOPs as any other, so a step costs the same whatever the
+    # weights are.
+
+    def _weighted_loss_from_hidden(self, h: torch.Tensor, input_ids: torch.Tensor,
+                                   weights: torch.Tensor) -> torch.Tensor:
+        B, S, H = h.shape
+        hs = h.reshape(-1, H)
+        # Target token at position t+1 is predicted from hidden state t; the
+        # last position of each row predicts nothing (weight 0, filler target).
+        ys2 = input_ids.new_zeros((B, S))
+        ys2[:, :-1] = input_ids[:, 1:]
+        w2 = torch.zeros((B, S), dtype=torch.float32, device=h.device)
+        w2[:, :-1] = weights[:, 1:].to(torch.float32)
+        ys = ys2.reshape(-1)
+        w = w2.reshape(-1)
+        n = hs.size(0)
+        chunks = max(1, int(getattr(self.cfg, "loss_chunks", 1) or 1))
+        step = (n + chunks - 1) // chunks
+        total = hs.new_zeros((), dtype=torch.float32)
+        lm_w = self.lm_head.weight
+
+        def _chunk(hc, yc, wc):
+            ce = F.cross_entropy(F.linear(hc, lm_w).float(), yc, reduction="none")
+            return (ce * wc).sum()
+
+        use_ckpt = self.training and chunks > 1 and getattr(self.cfg, "loss_ckpt", True)
+        for i in range(0, n, step):
+            hc, yc, wc = hs[i:i + step], ys[i:i + step], w[i:i + step]
+            s = _ckpt(_chunk, hc, yc, wc, use_reentrant=False) if use_ckpt else _chunk(hc, yc, wc)
+            total = total + s
+        # All-zero weights: a zero loss that still carries the graph (all grads zero).
+        return total / w.sum().clamp_min(1e-12)
+
+    def weighted_loss(self, input_ids: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        # Through __call__ so a compiled module runs the compiled graph.
+        return self(input_ids, weights=weights).loss
+
+    @torch.no_grad()
+    def token_losses(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Per-position cross-entropy ``(B, S)``: entry ``t`` is the loss of
+        predicting token ``t`` from its prefix; entry 0 is 0 (no prediction).
+        Chunked over positions so the full logits tensor is never materialized."""
+        h = self._backbone(input_ids)
+        B, S, H = h.shape
+        hs = h[:, :-1].reshape(-1, H)
+        ys = input_ids[:, 1:].reshape(-1)
+        n = hs.size(0)
+        chunks = max(1, int(getattr(self.cfg, "loss_chunks", 1) or 1))
+        step = (n + chunks - 1) // chunks
+        out = torch.empty(n, dtype=torch.float32, device=h.device)
+        lm_w = self.lm_head.weight
+        for i in range(0, n, step):
+            out[i:i + step] = F.cross_entropy(F.linear(hs[i:i + step], lm_w).float(),
+                                              ys[i:i + step], reduction="none")
+        res = torch.zeros((B, S), dtype=torch.float32, device=h.device)
+        res[:, 1:] = out.view(B, S - 1)
+        return res
 
 
 def maybe_compile_lean(model: nn.Module) -> nn.Module:

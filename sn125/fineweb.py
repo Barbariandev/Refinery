@@ -36,12 +36,16 @@ import torch
 log = logging.getLogger("sn125.fineweb")
 
 DATASET_REF = "HuggingFaceFW/fineweb-edu"
+# The fixed-budget 20h run consumes ~12.5B tokens (§3 calibration), so the
+# document-disjoint shard set must hold >12.5B UNIQUE tokens to avoid cycling.
+# The 10BT sample is too small; use the 100BT sample (still streamed once).
 DATASET_CONFIG = "sample-100BT"
-TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"
+TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"  # tokenizer is identical across the SmolLM2 family
 SEQ_LEN = 256
 SHUFFLE_SEED = 1337
-SHARD_TOKENS = 2 ** 24
+SHARD_TOKENS = 2 ** 24  # 16.7M tokens/shard = 32MB uint16
 
+# The dataset_name sentinel that routes _load_real_data to this module.
 SHARD_DATASET_NAME = "fineweb-edu-shards"
 
 MANIFEST_NAME = "MANIFEST.json"
@@ -76,11 +80,12 @@ def manifest_hash(body: dict) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
+# Builder
 
 
 def build_shards(
     out_dir: str | Path,
-    token_lists,
+    token_lists,                      # iterable of list[int], one per DOCUMENT (incl. any EOS)
     *,
     train_tokens: int,
     heldout_tokens: int,
@@ -98,7 +103,7 @@ def build_shards(
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(out_dir, 0o755)
+    os.chmod(out_dir, 0o755)  # sandbox eval runs as nobody/65534 → world-readable
     shard_seqs = max(1, shard_tokens // seq_len)
     targets = [("heldout", heldout_tokens // seq_len), ("train", train_tokens // seq_len)]
 
@@ -110,7 +115,7 @@ def build_shards(
         arr = np.stack(rows).astype(np.uint16)
         fname = f"{split}_{len(shards[split]):04d}.npy"
         np.save(out_dir / fname, arr)
-        os.chmod(out_dir / fname, 0o644)
+        os.chmod(out_dir / fname, 0o644)  # world-readable for the nobody sandbox
         shards[split].append({
             "file": fname,
             "sha256": _sha256_file(out_dir / fname),
@@ -139,6 +144,8 @@ def build_shards(
                     _flush(split, rows)
                     rows = []
         _flush(split, rows)
+        # Drop leftover buf: for heldout this discards the tail of the boundary
+        # document so it cannot leak into train; for train it's just the tail.
 
     body = {
         "version": 1,
@@ -157,17 +164,28 @@ def build_shards(
         body.update(meta)
     body["manifest_hash"] = manifest_hash(body)
     (out_dir / MANIFEST_NAME).write_text(json.dumps(body, indent=2, sort_keys=True))
-    os.chmod(out_dir / MANIFEST_NAME, 0o644)
+    os.chmod(out_dir / MANIFEST_NAME, 0o644)  # world-readable for the nobody sandbox
     log.info(f"manifest {body['manifest_hash'][:16]}: "
              f"train={body['totals']['train']} heldout={body['totals']['heldout']} seqs")
     return body
 
 
+# Fixed-budget Chinchilla volume (§4.3): the 20h run consumes ~12.5B tokens, so
+# we build ≥16B unique train tokens (+ a ≥300M-token document-disjoint held-out
+# split) at the calibrated seq_len=2048. 16B tok ≈ 32GB uint16 on disk — check
+# free space before the build (host is ~86% full).
 FIXED_BUDGET_TRAIN_TOKENS = 16_000_000_000
 FIXED_BUDGET_HELDOUT_TOKENS = 350_000_000
 FIXED_BUDGET_SEQ_LEN = 2048
-PROD_BUDGET_SECONDS = 72_000.0
+# Wall-clock budget for the production round (fixed-budget regime, SPEC §4.2): every
+# optimizer is given the SAME wall-clock budget and ranked on the loss it reaches
+# within it. 20h = the launch confirmation budget. It is part of the task_signature,
+# so genesis (which shares production_tasks) and the production round stay matched.
+PROD_BUDGET_SECONDS = 72_000.0  # 20h
 PROD_CONFIRM_STEPS = 188_000
+# Per-device batch size for the production round. 32 = the throughput-validated knee
+# (forge-train-throughput RECOMMENDED_TASK_SPEC; ~0.0907 MFU / 204 TFLOPs on B200). Part of
+# the task_signature, so genesis and the production round stay matched on the SAME batch.
 PROD_BATCH_SIZE = 32
 
 
@@ -218,8 +236,9 @@ def build_fineweb_shards(
     )
 
 
+# Loader (validator side)
 
-_VERIFIED_DIRS: set[tuple[str, str]] = set()
+_VERIFIED_DIRS: set[tuple[str, str]] = set()  # (dir, split) verified this process
 
 
 def load_manifest(data_dir: str | Path | None = None) -> dict:
@@ -344,10 +363,17 @@ def load_shard_batches(
     return [seq[b] for b in range(len(seq))]
 
 
+# First-class task config
 
+# Historical per-scale defaults live here for compatibility. The production
+# path calls make_fineweb_task through production_tasks(), which overrides seq
+# and batch with the fixed-budget launch values below.
 _FW_SHAPES = {
     "135M": ("FW1_smol_135M", "HuggingFaceTB/SmolLM2-135M", 4),
     "360M": ("FW2_smol_360M", "HuggingFaceTB/SmolLM2-360M", 4),
+    # Same shard/tokenizer contract as SmolLM2-360M, but built entirely from
+    # sn125/lean_model.py so isolated production workers do not need HF model
+    # or config downloads.
     "lean-360M": ("FW2_smol_360M", "lean-llama-360m", 4),
     "1.7B": ("FW3_smol_1.7B", "HuggingFaceTB/SmolLM2-1.7B", 2),
 }
@@ -381,10 +407,18 @@ def make_fineweb_task(model_size: str, total_steps: int, manifest: str,
         task_weight=1.0, use_pretrained=False,
         compute_budget_seconds=compute_budget_seconds,
         dataset=SHARD_DATASET_NAME, data_manifest=manifest,
+        # Production runs stop at the pinned horizon as well as at the budget
+        # (TaskSpec.stop_at_total_steps): equal steps for everyone who fits
+        # in 20h, no paid post-decay tail. Only meaningful in budget mode.
         stop_at_total_steps=bool(stop_at_total_steps and compute_budget_seconds > 0),
     )
 
 
+# Production scoring backbone. Launch uses the lean inline 360M model while
+# retaining the SmolLM2 tokenizer/data contract frozen into the shards (vocab
+# 49152 < 65536 → uint16 shard packing holds). Qwen3-0.6B (vocab 151936) is
+# used ONLY for synthetic-data throughput confirmation, so its larger vocab
+# never has to round-trip through uint16 storage.
 PROD_MODEL_SIZE = "lean-360M"
 PROD_MODEL_SIZE_ENV = "SN125_PROD_MODEL_SIZE"
 
@@ -409,7 +443,7 @@ def production_tasks(total_steps: int, *, data_dir: str | Path | None = None,
         raise FileNotFoundError(
             f"No production shards at {data_dir} (MANIFEST.json missing). "
             f"Build them first (scripts/build_prod_shards.py / build_shards()).")
-    mf = load_manifest(data_dir)
+    mf = load_manifest(data_dir)  # validates self-hash
     return [make_fineweb_task(model_size, total_steps=total_steps,
                               manifest=mf["manifest_hash"],
                               decay_fraction=decay_fraction,

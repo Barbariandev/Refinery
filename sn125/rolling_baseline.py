@@ -64,6 +64,8 @@ from typing import Optional
 log = logging.getLogger("sn125.rolling")
 
 
+# Curves with score below this floor are ignored when picking the rolling best
+# (e.g. failed runs return -1.0; we don't want a fail to define the baseline).
 MIN_VALID_SCORE = -0.5
 
 
@@ -75,8 +77,8 @@ class RollingBestCurve:
     and the round JSON can show *which* prior submission set the bar.
     """
     task_id: str
-    eval_points: list
-    train_points: list
+    eval_points: list  # [[step, eval_loss, wall_t], ...]
+    train_points: list  # [[step, train_loss], ...]
     wall_seconds: float
     state_multiplier: float
     final_eval_loss: float
@@ -136,7 +138,7 @@ def _curve_is_usable(curve: dict) -> bool:
     final_loss = last[1]
     if not isinstance(final_loss, (int, float)):
         return False
-    if final_loss <= 0 or final_loss != final_loss:
+    if final_loss <= 0 or final_loss != final_loss:  # nan check
         return False
     return True
 
@@ -171,10 +173,10 @@ def load_rolling_best(
 
     target_sig = task_signature(task)
     target_id = task["task_id"] if isinstance(task, dict) else task.task_id
-    candidates: list[RollingBestCurve] = []
-    anchors: list[RollingBestCurve] = []
+    candidates: list[RollingBestCurve] = []   # every usable curve (legacy pool)
+    anchors: list[RollingBestCurve] = []      # genesis + confirmed frontier curves
     rounds: dict[str, dict] = {}
-    event_refs: list[tuple[dict, dict]] = []
+    event_refs: list[tuple[dict, dict]] = []  # (event, round dict) for frontier events
 
     def _record(rid: str, section: str, key: str, sub: dict) -> Optional[RollingBestCurve]:
         score_obj = sub.get("score") or {}
@@ -208,6 +210,9 @@ def load_rolling_best(
         if exclude_round_id and rid == exclude_round_id:
             continue
 
+        # Only consider rounds whose TaskSpec signature matches ours.
+        # This prevents pinning a 24h R1_smol_135M run to a curve from a
+        # 100-step dev R1_smol_135M run — same task_id, very different bar.
         round_tasks = {t.get("task_id"): t for t in d.get("tasks", [])}
         rt = round_tasks.get(target_id)
         if not rt or task_signature(rt) != target_sig:
@@ -226,6 +231,13 @@ def load_rolling_best(
         if isinstance(ev, dict) and ev.get("hotkey"):
             event_refs.append((ev, d))
 
+    # The bar moves ONLY on confirmed frontier events (plus the pinned genesis
+    # anchor). Every other scored curve — including a sub-threshold "win" that
+    # was never paid — stays out of the baseline pool, so run-to-run noise
+    # cannot ratchet the reference downward one lucky draw at a time. Each
+    # event names the curve that set the bar (`baseline_curve_ref`: the WORSE
+    # of its submission/confirmation runs); events written before the ref
+    # existed fall back to the winner's curve in their own round.
     for ev, d in event_refs:
         ref = ev.get("baseline_curve_ref") or {}
         ref_rid = str(ref.get("round_id") or "") or str(d.get("round_id", ""))
@@ -255,10 +267,14 @@ def load_rolling_best(
 
     pool = anchors
     if not pool:
+        # No genesis round and no confirmed event for this panel (dev/test
+        # panels): legacy behaviour, best of every usable curve.
         log.warning(f"rolling_best: no genesis/frontier anchor for {target_id}; "
                     f"falling back to the best of {len(candidates)} scored curve(s)")
         pool = candidates
 
+    # "Best" = lowest final eval-loss. Score is a derived metric and may use a
+    # stale formula across rounds, so eval-loss is the cleanest invariant.
     best = min(pool, key=lambda c: c.final_eval_loss)
     log.info(f"rolling_best: {target_id} → loss={best.final_eval_loss:.4f} "
              f"from round={best.source_round_id} "
@@ -267,15 +283,30 @@ def load_rolling_best(
     return best
 
 
+# Cold-start scoring (round 1, before any rolling best exists)
 
+# An untrained 135M-vocab model has eval-loss ≈ log(vocab_size) ≈ 11.3.
+# An AdamW reference run on R1_smol_135M ends near 6.6 in 125 steps and
+# would reach ~3.5 with an 8h budget. A "perfect" miner is bounded near 2.0
+# (FineWeb-EDU intrinsic floor at this scale).
+# We map raw eval-loss to a [-1, +1] convergence score against these anchors:
+#     loss >= INIT_LOSS  → -1.0   (no learning)
+#     loss == REF_LOSS   →  0.0   (matches AdamW)
+#     loss <= FLOOR_LOSS → +1.0   (matches the practical floor)
+# These anchors are intentionally task-family-specific and conservative;
+# they only matter for round 1 and are quickly replaced by rolling-best.
 COLD_START_ANCHORS = {
+    # task_id_prefix → (init_loss, ref_loss, floor_loss)
     "R1_smol_135M": (11.3, 3.5, 2.0),
     "R2_smol_360M": (11.3, 3.2, 1.8),
     "R3_smol_1.7B": (11.3, 2.8, 1.5),
+    # Production FineWeb-Edu shard tasks (sn125.fineweb) — same anchors: the
+    # R-task anchors were already calibrated against FineWeb-EDU streaming.
     "FW1_smol_135M": (11.3, 3.5, 2.0),
     "FW2_smol_360M": (11.3, 3.2, 1.8),
     "FW3_smol_1.7B": (11.3, 2.8, 1.5),
 }
+# Generic fallback for any task we haven't anchored explicitly.
 DEFAULT_ANCHORS = (11.3, 4.0, 2.0)
 
 
@@ -292,10 +323,13 @@ def cold_start_score(task_id: str, final_eval_loss: float) -> float:
     if final_eval_loss <= floor:
         return 1.0
     if final_eval_loss >= ref:
+        # Between init (worst) and ref (par): map to [-1, 0]
         return -1.0 + (init - final_eval_loss) / (init - ref)
+    # Between ref (par) and floor (best): map to [0, +1]
     return (ref - final_eval_loss) / (ref - floor)
 
 
+# Self-test (safe to run without GPU or network)
 
 def _self_test() -> None:
     """In-process self-test. Exits 0 on success, raises on failure."""
@@ -303,12 +337,15 @@ def _self_test() -> None:
 
     tmp = Path(tempfile.mkdtemp(prefix="rolling_baseline_test_"))
     try:
+        # Empty dir → no rolling best, returns None
         task = {"task_id": "R1_smol_135M", "model_config": "HF/SmolLM2-135M",
                 "total_steps": 500, "batch_size": 4, "sequence_length": 256,
                 "use_pretrained": False, "compute_budget_seconds": 28800.0}
         rb = load_rolling_best(tmp, task)
         assert rb is None, f"empty dir should return None, got {rb}"
 
+        # Two rounds: round_a is best (lower final loss); round_b is worse;
+        # round_c has matching task_id but different total_steps (excluded).
         round_a = {
             "round_id": "round_a",
             "tasks": [task],
@@ -335,6 +372,9 @@ def _self_test() -> None:
                             "train_points": [[0, 11.3], [500, 5.6]],
                             "wall_seconds": 100.0, "state_multiplier": 1.5,
                             "failed": False, "error": ""}}}}}
+        # Different budget → different signature → must NOT be picked even
+        # though final loss is "best." (total_steps can't serve here: in
+        # budget mode it is deliberately excluded from the signature.)
         round_c = {
             "round_id": "round_c",
             "tasks": [{**task, "compute_budget_seconds": 3600.0}],
@@ -344,10 +384,11 @@ def _self_test() -> None:
                     "code_hash": "deadbeef" + "0" * 56,
                     "curves": {
                         "R1_smol_135M": {
-                            "eval_points": [[0, 11.3, 0.5], [100, 2.0, 50.0]],
+                            "eval_points": [[0, 11.3, 0.5], [100, 2.0, 50.0]],  # bogus great
                             "train_points": [[0, 11.3], [100, 2.0]],
                             "wall_seconds": 50.0, "state_multiplier": 1.5,
                             "failed": False, "error": ""}}}}}
+        # A failed curve under the right signature — must be excluded
         round_d = {
             "round_id": "round_d",
             "tasks": [task],
@@ -370,23 +411,29 @@ def _self_test() -> None:
             f"should pick round_a (loss=4.0), got {rb.source_round_id} (loss={rb.final_eval_loss})"
         assert abs(rb.final_eval_loss - 4.0) < 1e-6, f"unexpected final_loss {rb.final_eval_loss}"
         assert rb.source_code_hash == "aabbccdd" + "00000000"
+        # round_c was the lowest loss but wrong signature → excluded
+        # round_d was failed → excluded
 
+        # exclude_round_id: passing round_a forces fallback to round_b
         rb2 = load_rolling_best(tmp, task, exclude_round_id="round_a")
         assert rb2 is not None and rb2.source_round_id == "round_b", \
             f"with round_a excluded, should pick round_b, got {rb2}"
 
+        # min_score floor: with min_score=0.0, round_b (-0.10) is excluded;
+        # only round_a remains.
         rb3 = load_rolling_best(tmp, task, min_score=0.0)
         assert rb3.source_round_id == "round_a"
 
+        # cold_start_score sanity
         s_init = cold_start_score("R1_smol_135M", 11.3)
         assert s_init == -1.0
         s_ref = cold_start_score("R1_smol_135M", 3.5)
         assert abs(s_ref) < 1e-6, f"ref should be 0, got {s_ref}"
         s_floor = cold_start_score("R1_smol_135M", 2.0)
         assert s_floor == 1.0
-        s_mid = cold_start_score("R1_smol_135M", 5.0)
+        s_mid = cold_start_score("R1_smol_135M", 5.0)  # between init and ref
         assert -1.0 < s_mid < 0.0, f"mid-poor should be in (-1, 0), got {s_mid}"
-        s_great = cold_start_score("R1_smol_135M", 2.5)
+        s_great = cold_start_score("R1_smol_135M", 2.5)  # between ref and floor
         assert 0.0 < s_great < 1.0, f"between ref and floor should be (0,1), got {s_great}"
         s_unknown = cold_start_score("FROBNICATE_99B", 4.0)
         assert s_unknown == 0.0, f"unknown task at default ref=4.0 should be 0, got {s_unknown}"

@@ -63,8 +63,11 @@ log = logging.getLogger("sn125.cloud_lambda")
 LAMBDA_BASE = "https://cloud.lambdalabs.com/api/v1"
 LAMBDA_SSH_KEY_PATH = SSH_KEY_DIR / "lambda_id_ed25519"
 
+# Lambda VMs cold-boot a full OS image: 3-15 min to `active` is normal.
 LAMBDA_STARTUP_TIMEOUT = int(os.environ.get("SN125_LAMBDA_STARTUP_TIMEOUT", "1500"))
 
+# Canonical SKU → Lambda instance type. Keeps the orchestrator's resource
+# string identical across providers (b200-small stays the prod SKU).
 SKU_INSTANCE_MAP = {
     "b200-small": "gpu_1x_b200_sxm6",
     "b200-medium": "gpu_2x_b200_sxm6",
@@ -74,6 +77,8 @@ SKU_INSTANCE_MAP = {
     "h100-xlarge": "gpu_8x_h100_sxm5",
 }
 
+# Instance statuses (API enum: active/booting/unhealthy/terminated) mapped to
+# the Targon-shaped statuses the orchestrator's wait/sweep logic understands.
 _STATUS_MAP = {
     "active": "RUNNING",
     "booting": "PROVISIONING",
@@ -83,6 +88,8 @@ _STATUS_MAP = {
 }
 _TERMINAL_STATUSES = frozenset({"FAILED", "DELETED"})
 
+# Run as ubuntu (the only login Lambda provisions) to make the VM look like a
+# Targon/Lium box: root SSH with our key + a root-owned /workspace.
 _ROOT_BOOTSTRAP = (
     "sudo install -d -m 700 -o root -g root /root/.ssh && "
     "sudo install -m 600 -o root -g root ~/.ssh/authorized_keys "
@@ -141,8 +148,12 @@ class LambdaClient:
         self.base = base_url.rstrip("/")
         self.key_path = Path(key_path) if key_path else LAMBDA_SSH_KEY_PATH
         self._key_name = ""
+        # instance id -> ip, for direct SSH addressing.
         self._ssh_ip: dict[str, str] = {}
+        # instance id -> launch epoch. Lambda's API reports no created_at, so
+        # the orchestrator's staleness sweep gets a locally stamped one.
         self._launched_at: dict[str, float] = {}
+        # instance-types payload cache (availability + pricing poll constantly).
         self._types_cache: tuple[dict, float] | None = None
         self._types_ttl_s = 60.0
 
@@ -178,6 +189,7 @@ class LambdaClient:
                 raise RuntimeError(f"Lambda {method} {path}: {e}") from e
         return {}
 
+    # 1. Inventory
     def list_instance_types(self) -> dict:
         """GET /instance-types: {type_name: {instance_type, regions_with_capacity_available}},
         cached ~1 min (availability and pricing are polled constantly)."""
@@ -221,6 +233,7 @@ class LambdaClient:
             log.warning(f"live price lookup failed for {resource_name!r}: {e}")
         return SKU_COSTS.get(resource_name, 7.0)
 
+    # 2. SSH keys
     def list_ssh_keys(self) -> list[dict]:
         resp = self._req("GET", "/ssh-keys")
         return resp if isinstance(resp, list) else []
@@ -250,6 +263,8 @@ class LambdaClient:
                 self._key_name = key.get("name", "")
                 log.info(f"SSH key already registered with Lambda: '{self._key_name}'")
                 return self._key_name
+        # Key names are unique per account; dodge a same-name key that belongs
+        # to different material (e.g. another validator box).
         name = SSH_KEY_NAME
         if name in taken_names:
             name = f"{SSH_KEY_NAME}-{material[-8:].replace('/', '_').replace('+', '-')}"
@@ -258,6 +273,7 @@ class LambdaClient:
         log.info(f"Registered SSH key '{name}' with Lambda")
         return name
 
+    # 3. Instances (the orchestrator's "workloads")
     def create_workload(self, name: str, resource_name: str, ssh_key_uid: str,
                         image: str = "", envs: list[dict] = None,
                         args: list[str] = None) -> dict:
@@ -289,6 +305,8 @@ class LambdaClient:
                 resp = self._req("POST", "/instance-operations/launch", body,
                                  timeout=60)
             except Exception as e:
+                # Capacity can vanish between the listing and the launch;
+                # fall through to the next region.
                 last_err = e
                 log.warning(f"launch in {region} failed: {e}")
                 continue
@@ -400,6 +418,7 @@ class LambdaClient:
             })
         return out
 
+    # 4. SSH addressing (orchestrator hook)
     def _ssh_cmd_for(self, user_host: str) -> list[str]:
         return ["ssh", "-i", str(self.key_path),
                 "-o", "StrictHostKeyChecking=accept-new",

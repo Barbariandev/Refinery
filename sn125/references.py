@@ -411,6 +411,9 @@ REFERENCE_OPTIMIZERS = {"adamw": ADAMW_SOURCE, "adamw_fused": FUSED_ADAMW_SOURCE
                         "sgdm": SGDM_SOURCE, "adam": ADAM_SOURCE, "sgd": SGD_SOURCE,
                         "lion": LION_SOURCE, "schedule_free": SCHEDULE_FREE_SOURCE,
                         "prodigy": PRODIGY_SOURCE, "muon": MUON_SOURCE}
+# Baseline is ADAMW_SOURCE (Python). FUSED_ADAMW_SOURCE has 1.3% numerical regression
+# on T1 (6.007 vs 5.930) — Triton compilation precision differs from PyTorch ops.
+# Triton support remains for miners to submit fused kernels for speed benefits.
 
 
 def sweep_verdict(runs: list) -> dict:
@@ -464,6 +467,7 @@ def extract_hparams(source: str, task_config: dict = None) -> dict:
                                           if k not in ("pretrained", "scratch")}
                                 result.update(overrides)
                                 return result
+                        # Strip sub-dicts from returned hparams
                         return {k: v for k, v in hp.items()
                                 if k not in ("pretrained", "scratch")}
     except Exception:

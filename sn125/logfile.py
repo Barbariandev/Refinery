@@ -21,7 +21,7 @@ DEFAULT_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_BACKUPS = 5
 MAX_BYTES_ENV = "SN125_PROCESS_LOG_MAX_BYTES"
 BACKUPS_ENV = "SN125_PROCESS_LOG_BACKUPS"
-DISABLE_ENV = "SN125_PROCESS_LOG"
+DISABLE_ENV = "SN125_PROCESS_LOG"          # "0" disables the file copy
 
 _FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 

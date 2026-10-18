@@ -64,6 +64,49 @@ def _existing_ok(data_dir: Path, *, expected_manifest: str, verify_hashes: bool)
         }
 
 
+# The production snapshot is 976 files; every file is ~2 Hub "resolver" requests
+# and the quota is 5000 per 5 minutes per account, shared by every box staging
+# at the same time. A third concurrent box therefore gets HTTP 429 — which
+# huggingface_hub reports from its HEAD call as a bare LocalEntryNotFoundError
+# ("cannot find the requested files in the local cache"), hiding the cause.
+# snapshot_download resumes what is already on disk, so waiting out the quota
+# window and calling again finishes the job instead of failing the box
+# (12 evaluations lost this way in rounds 20, 26, 27, 28).
+DOWNLOAD_ATTEMPTS = int(os.environ.get("SN125_FINEWEB_DOWNLOAD_ATTEMPTS", "6"))
+DOWNLOAD_BACKOFF_S = (60, 120, 240, 300, 300)
+
+
+def _describe(exc: BaseException) -> str:
+    parts = [f"{type(exc).__name__}: {exc}"]
+    cause = exc.__cause__ or exc.__context__
+    seen = 0
+    while cause is not None and seen < 3:
+        parts.append(f"caused by {type(cause).__name__}: {cause}")
+        cause = cause.__cause__ or cause.__context__
+        seen += 1
+    return " | ".join(p.strip() for p in parts)
+
+
+def _download_with_backoff(fn, **kwargs):
+    """Call ``fn(**kwargs)`` (snapshot_download) up to DOWNLOAD_ATTEMPTS times,
+    sleeping DOWNLOAD_BACKOFF_S between attempts; re-raises the last error with
+    its cause chain in the message so a 429 is visible in the audit."""
+    last: BaseException | None = None
+    attempts = max(1, DOWNLOAD_ATTEMPTS)
+    for i in range(attempts):
+        try:
+            return fn(**kwargs)
+        except Exception as e:  # noqa: BLE001 — any Hub/network failure is retried
+            last = e
+            if i + 1 >= attempts:
+                break
+            wait = DOWNLOAD_BACKOFF_S[min(i, len(DOWNLOAD_BACKOFF_S) - 1)]
+            print(f"stage-shards: download attempt {i + 1}/{attempts} failed ({_describe(e)}); "
+                  f"retrying in {wait}s", flush=True)
+            time.sleep(wait)
+    raise RuntimeError(f"shard download failed after {attempts} attempts: {_describe(last)}") from last
+
+
 def _download_from_hf(
     data_dir: Path,
     *,
@@ -84,7 +127,8 @@ def _download_from_hf(
     subdir = subdir.strip("/")
     if subdir:
         patterns = [f"{subdir}/{MANIFEST_NAME}", f"{subdir}/*.npy"]
-        snapshot = Path(snapshot_download(
+        snapshot = Path(_download_with_backoff(
+            snapshot_download,
             repo_id=repo_id,
             repo_type=repo_type,
             revision=revision or None,
@@ -93,7 +137,8 @@ def _download_from_hf(
         src = snapshot / subdir
         shutil.copytree(src, tmp)
     else:
-        snapshot_download(
+        _download_with_backoff(
+            snapshot_download,
             repo_id=repo_id,
             repo_type=repo_type,
             revision=revision or None,
@@ -136,6 +181,9 @@ def make_world_readable(data_dir: Path) -> None:
         os.chmod(data_dir, 0o755)
     except OSError:
         pass
+    # Ancestors: only inside the eval box's /workspace tree. Never widen a
+    # home directory or anything else on a dev host (a 0700 /root must stay
+    # 0700 — it holds .env and keys).
     p = data_dir.parent
     workspace = Path("/workspace")
     while p != p.parent and (p == workspace or workspace in p.parents):

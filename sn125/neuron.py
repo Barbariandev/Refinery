@@ -34,6 +34,8 @@ from .config import (
     MIN_FRONTIER_IMPROVEMENT,
     NETUID,
     PROGRESS_HALF_LIFE_DAYS,
+    REFINER_START_TIMESTAMP,
+    ROUND_GRID_ANCHOR_TIMESTAMP,
     full_pay_reference_nats,
     launch_burn_fraction_for_day,
     launch_day,
@@ -44,6 +46,10 @@ from .config import (
 
 log = logging.getLogger("sn125")
 
+# Weight-set cadence: validators should write weights roughly once per epoch
+# (~360 blocks × 12s ≈ 72 min) for vtrust. Rounds last 24h, so between rounds
+# the last computed weights are re-set on this interval (roundsm/live.py and
+# AttestationValidator both use it).
 WEIGHT_REFRESH_SECONDS = 360 * 12
 
 _SIGNING_EXCLUDE = frozenset(("sources", "signature", "bundle_hash"))
@@ -75,7 +81,7 @@ def _normalize_checkpoints(cps) -> list:
         rec = {}
         for k, v in c.items():
             if k == "path":
-                continue
+                continue  # box-local filesystem path — must never reach a signed bundle
             if k in ("pct", "eval_loss", "wall_t"):
                 try: rec[k] = float(v)
                 except (TypeError, ValueError): rec[k] = v
@@ -89,21 +95,22 @@ def _normalize_checkpoints(cps) -> list:
                             r.get("step", 0) if isinstance(r.get("step"), int) else 0))
     return out
 
+# Protocol
 
 class GetSubmission(bt.Synapse):
     """Validator requests a miner's optimizer source for a round."""
     required_hash_fields: ClassVar[tuple[str, ...]] = ("round_id",)
     round_id: str = ""
-    source_code: str = ""
-    code_hash: str = ""
-    name: str = ""
-    description: str = ""
+    source_code: str = ""   # miner fills this
+    code_hash: str = ""     # miner fills this
+    name: str = ""          # miner fills (display only)
+    description: str = ""   # miner fills (display only)
 
 class CommitHash(bt.Synapse):
     """Miner pre-commits optimizer hash before seeing the reveal seed."""
     required_hash_fields: ClassVar[tuple[str, ...]] = ("round_id",)
     round_id: str = ""
-    code_hash: str = ""
+    code_hash: str = ""     # SHA-256 of source_code
 
 class Ping(bt.Synapse):
     """Health check."""
@@ -150,6 +157,10 @@ def _set_weights_from_map(subtensor, wallet, netuid: int, meta: bt.Metagraph,
         elif hk in hk_to_uid:
             uid = hk_to_uid[hk]
         else:
+            # A frontier hotkey that is no longer registered (deregistered
+            # legacy winner). Its share must BURN: silently dropping it would
+            # let the chain-side renormalization hand that emission to the
+            # remaining hotkeys pro-rata and dilute the configured burn.
             log.warning("  hotkey %s not in metagraph; routing its %.4f weight to burn UID %d",
                         hk[:16], w, burn_uid)
             uid = burn_uid
@@ -165,26 +176,53 @@ def _set_weights_from_map(subtensor, wallet, netuid: int, meta: bt.Metagraph,
     except Exception as e:
         log.error(f"  Failed to set weights: {e}")
 
+# Miner
 
 class Miner:
     """Serves an optimizer submission via Axon."""
 
     def __init__(self, wallet: bt.Wallet, port: int = 8091,
-                 optimizer_path: Optional[str] = None):
+                 optimizer_path: Optional[str] = None,
+                 refiner_path: Optional[str] = None,
+                 weights_path: Optional[str] = None,
+                 weights_url: Optional[str] = None):
         self.wallet = wallet
-        self.source_code = self._load_source(optimizer_path)
-        self.code_hash = hashlib.sha256(self.source_code.encode()).hexdigest()
         self.name = "miner-submission"
         self.description = ""
-        violations = validate_source(self.source_code)
-        if violations:
-            raise SandboxViolation(f"Optimizer source invalid: {violations}")
+        if refiner_path:
+            # Refiner task (Challenge 2): what is served and committed to is the
+            # canonical envelope (source + hash/size/URL of the weight file).
+            self.source_code = self._refiner_envelope(refiner_path, weights_path, weights_url)
+            self.code_hash = hashlib.sha256(self.source_code.encode()).hexdigest()
+        else:
+            self.source_code = self._load_source(optimizer_path)
+            self.code_hash = hashlib.sha256(self.source_code.encode()).hexdigest()
+            violations = validate_source(self.source_code)
+            if violations:
+                raise SandboxViolation(f"Optimizer source invalid: {violations}")
         self.axon = bt.Axon(wallet=wallet, port=port)
         self.axon.attach(forward_fn=self.handle_get_submission,
                          verify_fn=self.verify_get_submission)
         self.axon.attach(forward_fn=self.handle_commit_hash,
                          verify_fn=self.verify_commit_hash)
         self.axon.attach(forward_fn=self.handle_ping)
+
+    @staticmethod
+    def _refiner_envelope(refiner_path: str, weights_path: Optional[str],
+                          weights_url: Optional[str]) -> str:
+        from .refiner.submission import (build_envelope, gate_envelope, parse_envelope,
+                                         weights_ref)
+        if bool(weights_path) != bool(weights_url):
+            raise ValueError("a refiner with weights needs both --weights (the local file, "
+                             "to hash) and --weights-url (where the validator's box downloads it)")
+        ref = weights_ref(weights_path, weights_url) if weights_path else None
+        text = build_envelope(Path(refiner_path).read_text(), ref)
+        if len(text.encode()) > 1_048_576:
+            raise ValueError("refiner submission exceeds the 1 MB transport limit")
+        ok, why = gate_envelope(parse_envelope(text))
+        if not ok:
+            raise SandboxViolation(f"Refiner source invalid: {why}")
+        return text
 
     def _load_source(self, path: Optional[str]) -> str:
         if path and os.path.exists(path):
@@ -212,7 +250,7 @@ class Miner:
     def handle_commit_hash(self, synapse: CommitHash) -> CommitHash:
         _require_authorized_validator(synapse)
         synapse.code_hash = self.code_hash
-        synapse.round_id = synapse.round_id
+        synapse.round_id = synapse.round_id  # echo back
         return synapse
 
     def handle_ping(self, synapse: Ping) -> Ping:
@@ -237,6 +275,7 @@ class Miner:
             self.stop()
 
 
+# Validator
 
 class Validator:
     """Fetches miner submissions, evaluates them, computes weights."""
@@ -263,6 +302,10 @@ class Validator:
         self.set_weights_enabled = set_weights
         self.submission_timeout = submission_timeout
         self.mode = mode
+        # "local" (no cloud), or an ORDERED comma-separated provider failover
+        # chain (e.g. "lambda,targon"): the orchestrator rents from the first
+        # provider with B200 capacity and fails over down the chain; the round
+        # pauses only when every provider is dry.
         self.backend = backend
         if wallet is not None:
             hk = wallet.hotkey.ss58_address
@@ -276,12 +319,17 @@ class Validator:
         if providers and providers != ["local"]:
             from .cloud import (TargonOrchestrator, ensure_scoring_providers,
                                 make_failover_client)
+            # Scoring trust boundary: unknown providers and lium (untrusted
+            # marketplace hosts) are refused loudly, never silently skipped.
             providers = ensure_scoring_providers(providers)
             expected_manifest = next(
                 (getattr(t, "data_manifest", "") for t in self.tasks
                  if getattr(t, "data_manifest", "")),
                 "",
             )
+            # All providers drive the same orchestrator (one shared spend cap +
+            # rental semaphore); only the client layer (rental API, SSH
+            # addressing, pricing, failover routing) differs.
             cloud_client = make_failover_client(providers, int(submission_timeout))
             self._cloud_orch = TargonOrchestrator(
                 client=cloud_client,
@@ -290,27 +338,47 @@ class Validator:
             self._cloud_orch.initialize()
         self.dendrite = bt.Dendrite(wallet=wallet) if wallet else None
         self.subtensor = bt.Subtensor(network=network) if (wallet and set_weights) else None
-        self.baseline_cache: dict[str, dict] = {}
+        self.baseline_cache: dict[str, dict] = {}  # evicted to last 2 rounds
+        # Scoring baseline is the rolling best: the lowest-eval-loss historical
+        # curve per TaskSpec signature (round-1 fallback is a synthetic
+        # cold-start anchor; the best valid early submission then becomes the
+        # baseline for future rounds). See _compute_rolling_best_baselines.
         if baseline != "rolling_best":
             raise ValueError(f"baseline must be 'rolling_best', got {baseline!r}")
         self.baseline = baseline
         self.rounds_dir = rounds_dir or str(Path(__file__).parent / "rounds")
         self.audit_dir = audit_dir or str(Path(self.rounds_dir).parent / "audit")
+        # Confirmed frontier events earn by size and recency of improvement.
+        # There is no separate leader bonus; non-improving submissions earn zero.
         self.burn_uid = BURN_UID if burn_uid is None else int(burn_uid)
+        # Absolute floor on g_i (held-out-loss improvement in NATS, min over
+        # tasks). The effective bar is max(this, the adaptive noise threshold)
+        # — see _min_improvement_threshold.
         self.min_improvement = (
             MIN_FRONTIER_IMPROVEMENT if min_improvement is None else float(min_improvement)
         )
+        # Independent confirmation runs a bar-clearing candidate must pass
+        # before it becomes a paid frontier event (0 = pay on the single run).
         self.frontier_confirmation_runs = (
             FRONTIER_CONFIRMATION_RUNS if frontier_confirmation_runs is None
             else max(0, int(frontier_confirmation_runs)))
         self.frontier_confirmation_max_attempts = FRONTIER_CONFIRMATION_MAX_ATTEMPTS
+        # Last computed weight map (re-set on chain between rounds for vtrust).
         self._last_weights: dict[str, float] = {}
+        # All miner emission is eligible from day one. With no confirmed
+        # frontier event, compute_weights still emits 100% burn.
         self.burn_fraction_floor = (
             LAUNCH_BURN_FRACTION_FLOOR if burn_fraction_floor is None
             else float(burn_fraction_floor)
         )
+        # Progress-scaled payout (config.py): credit half-life and the
+        # launch anchor for the full-pay reference ramp / day-based burn floor.
         self.progress_half_life_days = PROGRESS_HALF_LIFE_DAYS
         self.launch_timestamp = int(LAUNCH_TIMESTAMP or 0)
+        # Round schedule (config.py): the 24 h grid rounds open on, and the
+        # instant from which rounds carry Challenge 2. Read by the FSM loop.
+        self.round_grid_anchor = int(ROUND_GRID_ANCHOR_TIMESTAMP or 0)
+        self.refiner_start_timestamp = int(REFINER_START_TIMESTAMP or 0)
         self._burn_floor_explicit = burn_fraction_floor is not None
         self._last_frontier_rewards: dict = {}
 
@@ -403,11 +471,17 @@ class Validator:
         baseline_hp: dict[str, tuple[float, float]] = {}
 
         for task in self.tasks:
+            # We still surface AdamW's hparams so the per-task scoring breakdown
+            # can record what "good" hparams look like for this rung. The miner
+            # gets evaluated at ITS OWN declared hparams; this is presentation only.
             best_lr, best_wd = self._hparams_for_task(ADAMW_SOURCE, task)
             baseline_hp[task.task_id] = (best_lr, best_wd)
 
             rb = load_rolling_best(self.rounds_dir, task, exclude_round_id=round_id)
             if rb is not None:
+                # Reuse the historical curve. lr/wd are recorded as the rolling
+                # winner's submitted hparams (best-effort — we don't always have
+                # them in the round JSON, so fall back to AdamW's).
                 curve = TrainingCurve(
                     task_id=task.task_id, lr=best_lr, wd=best_wd,
                     eval_points=[tuple(p) for p in rb.eval_points],
@@ -416,6 +490,7 @@ class Validator:
                     state_multiplier=rb.state_multiplier,
                     failed=False, error="")
                 baselines[task.task_id] = [curve]
+                # per_step from actual_steps (matches Phase 300 fix in AdamW path)
                 actual_steps = max(curve.eval_points[-1][0], 1) if curve.eval_points else max(task.total_steps, 1)
                 step_times[task.task_id] = {
                     "per_step": rb.wall_seconds / actual_steps if rb.wall_seconds > 0 else 0.0,
@@ -428,11 +503,19 @@ class Validator:
                 log.info(f"  {task.task_id}: rolling-best from round={rb.source_round_id} "
                          f"hash={rb.source_code_hash} loss={rb.final_eval_loss:.4f}")
             else:
+                # Round-1 cold start: synthesize a 2-point curve at the task-family
+                # anchor's "ref" loss. Miners that beat the anchor get positive
+                # convergence; miners that match it get ≈0; miners that lose get
+                # negative. Same semantics as `cold_start_score` modulo the linear
+                # vs piecewise mapping (linear via convergence formula here).
                 init_loss, ref_loss, _floor_loss = COLD_START_ANCHORS.get(
                     task.task_id, DEFAULT_ANCHORS)
                 _budget = float(getattr(task, "compute_budget_seconds", 0.0) or 0.0)
+                # Use the task budget if set; else 1.0 so per_step math doesn't blow up
                 synth_wall = _budget if _budget > 0 else 1.0
                 synth_steps = max(task.total_steps, 1)
+                # Two-point curve: start at init_loss (untrained), end at ref_loss
+                # (par). Includes wall_t third element so V21+ schema is satisfied.
                 synth_curve = TrainingCurve(
                     task_id=task.task_id, lr=best_lr, wd=best_wd,
                     eval_points=[(0, float(init_loss), 0.0),
@@ -440,6 +523,8 @@ class Validator:
                     train_points=[(0, float(init_loss)),
                                   (synth_steps, float(ref_loss))],
                     wall_seconds=synth_wall,
+                    # state_multiplier=0 means "unknown" — memory penalty becomes
+                    # symmetric (no advantage either way) for round 1.
                     state_multiplier=0.0,
                     failed=False, error="")
                 baselines[task.task_id] = [synth_curve]
@@ -455,9 +540,11 @@ class Validator:
                 log.info(f"  {task.task_id}: cold-start anchor "
                          f"(init={init_loss}, ref={ref_loss}, budget={synth_wall:.0f}s)")
 
+        # Cache result. No BT, no transfer audit in rolling-best mode (yet).
         self._cache_baselines(round_id, baselines, step_times, baseline_hp)
         return baselines, step_times, baseline_hp
 
+    # Sentinel hotkey for the burn allocation; resolved to `self.burn_uid` on chain.
     BURN_KEY = "__BURN__"
 
     @staticmethod
@@ -510,8 +597,11 @@ class Validator:
         comp = sr.components or {}
         sp = comp.get("significance_pareto") or {}
         if sp.get("evaluable"):
+            # Significant iff a confident per-task win AND no confident regression.
             significant = bool(sp.get("sig_wins")) and not sp.get("sig_losses")
         else:
+            # No paired variance available (K=1 / dev): fall back to the point
+            # estimate clearing the absolute floor.
             significant = g > 0.0
         return g, significant
 
@@ -713,9 +803,13 @@ class Validator:
         confirmations = confirmations or {}
         conf_runs = int(self.frontier_confirmation_runs)
         pending = self._load_pending_confirmations() if conf_runs > 0 else []
+        # Adaptive noise bar (from PRIOR events only): a new frontier event must
+        # clear it, so beating the leader by run-to-run noise alone stays
+        # negative-EV while real improvements are landing.
         min_improvement = self._min_improvement_threshold(events, now)
         sigs = self._frontier_task_signatures()
 
+        # ── 1. resolve pending confirmations ────────────────────────────────
         outcomes: list[dict] = []
         confirmed: list[tuple] = []
         still_pending: list[dict] = []
@@ -764,6 +858,8 @@ class Validator:
                                      "baseline_losses": base,
                                      "confirmation_losses": conf_losses})
                 continue
+            # Not a scored record: the confirmation could not be run, or the
+            # miner's code failed on the re-run.
             if isinstance(c, ScoreRecord):
                 verdict, reason = "dq", "confirmation run failed"
             elif isinstance(c, dict):
@@ -787,6 +883,7 @@ class Validator:
                 outcomes.append({**rec, "outcome": "retry", "attempts": attempts,
                                  "reason": reason})
 
+        # ── 2. best confirmed candidate becomes the frontier event ──────────
         new_event = None
         if confirmed:
             confirmed.sort(key=lambda x: (-x[0], x[1].get("code_hash", "")))
@@ -829,6 +926,8 @@ class Validator:
                                  "outcome": "superseded", "improvement": float(g2),
                                  "reason": "a better candidate confirmed in the same round"})
 
+        # ── 3. this round's candidates ──────────────────────────────────────
+        # Among significant improvers only the best becomes a frontier candidate.
         frontier_losses = new_event["task_final_losses"] if new_event else None
         candidates: list[tuple[float, str, ScoreRecord]] = []
         for hk, sr in results.items():
@@ -836,6 +935,7 @@ class Validator:
                 continue
             g, significant = self._improvement_and_significance(sr)
             if frontier_losses:
+                # The bar moved this round: measure against the confirmed frontier.
                 g2 = self._improvement_nats(frontier_losses, self._task_losses(sr, "sub_final_loss"))
                 if g2 is not None:
                     g = g2
@@ -915,6 +1015,7 @@ class Validator:
             self._last_weights = dict(weights)
             return weights
 
+        # ── 4. pay: progress-scaled, pro rata to decayed credit ────────────
         leader_hk = events[-1].get("hotkey", "")
         half_life_s = max(1.0, self.progress_half_life_days * 86400.0)
         active_events = []
@@ -937,6 +1038,7 @@ class Validator:
             active_events.append(item)
             total_credit += credit
 
+        # Ramp anchor: the launch timestamp, else the first confirmed event.
         anchor = self.launch_timestamp or first_ts
         full_pay_ref = full_pay_reference_nats(now, anchor)
         progress_share = progress_payable_share(total_credit, now, anchor)
@@ -987,6 +1089,11 @@ class Validator:
         return baselines, code_hashes, sources_by_hash
 
     def _task_dicts(self):
+        # `dataset` and `data_manifest` MUST be serialized: rolling_baseline.task_signature
+        # keys on both (the S1 data-pin). Omitting them made every stored round's task
+        # signature collapse to the (dataset="fineweb-edu", data_manifest="") defaults, so a
+        # manifest-pinned production task could never match its own prior-round curve →
+        # rolling-best perpetually fell back to cold-start and never accumulated.
         return [{"task_id": t.task_id, "model_config": t.model_config,
                  "total_steps": t.total_steps, "batch_size": t.batch_size,
                  "sequence_length": t.sequence_length, "use_pretrained": t.use_pretrained,
@@ -1000,8 +1107,15 @@ class Validator:
             cd = curve_data[hk]
             out = {"curves": cd.get("curves", {}),
                    "hparams_per_task": cd.get("hparams_per_task", {})}
+            # Hardware provenance (provider, pre/post throughput probes,
+            # achieved rate) — public-safe by construction (roundsm/live.py
+            # _eval_provenance); published so every score is auditable against
+            # the box that produced it.
             if cd.get("provenance"):
                 out["provenance"] = cd["provenance"]
+            # Quartile audit checkpoints: surface a clean per-submission list for the
+            # dashboard / audit consumers. Prefer an explicit submission-level list if
+            # the emitter set one; else aggregate the per-task curve checkpoints.
             cps = cd.get("checkpoints")
             if not cps:
                 agg = []
@@ -1020,7 +1134,8 @@ class Validator:
                      curve_data: dict[str, dict] = None,
                      pause_reasons: list = None,
                      round_report: dict = None,
-                     confirmation_records: dict = None):
+                     confirmation_records: dict = None,
+                     refiner_block: dict = None):
         """Persist round results as JSON for dashboard consumption.
 
         ``confirmation_records`` ({confirm-key: {hotkey, code_hash, score,
@@ -1052,11 +1167,20 @@ class Validator:
             "code_hashes": code_hashes,
             "frontier_rewards": getattr(self, "_last_frontier_rewards", {}),
         }
+        if refiner_block:
+            # Refiner task (Challenge 2): results, frontier and pool weights
+            # (roundsm/refiner_round.py, roundsm/refiner_frontier.py); `weights`
+            # above is already the blend of both pools.
+            out["refiner_task"] = refiner_block
         if confirmation_records:
             out["confirmations"] = confirmation_records
         if pause_reasons:
+            # §2.4 audit record: any B200 capacity-delay / outage pause this round.
             out["pause_reasons"] = list(pause_reasons)
         if round_report:
+            # FSM lifecycle report is source-free and public: miners can see
+            # whether their commit was accepted, selected, deferred, DQ'd, or
+            # rejected before acceptance.
             out["fsm_report"] = round_report
             out["selection"] = {
                 "rule": round_report.get("selection_rule", ""),
@@ -1068,21 +1192,26 @@ class Validator:
         if sources_by_hash:
             out["sources"] = sources_by_hash
         out["_writer_pid"] = os.getpid()
+        # MUST be the configured rounds_dir: the rolling baseline, publisher,
+        # dashboard, and FSM audit all read from it. Writing to a hardcoded
+        # path while they read the configured one silently freezes the frontier.
         outdir = Path(self.rounds_dir); outdir.mkdir(parents=True, exist_ok=True)
         dest = outdir / f"{round_id}.json"
+        # Abort if another live process owns this file
         if dest.exists():
             try:
                 existing = json.loads(dest.read_text())
                 epid = existing.get("_writer_pid")
                 if epid and epid != os.getpid():
                     try:
-                        os.kill(epid, 0)
+                        os.kill(epid, 0)  # check if alive
                         logging.warning("Round file %s owned by live PID %s, refusing to overwrite", dest, epid)
                         return
                     except OSError:
-                        pass
+                        pass  # dead process, safe to overwrite
             except Exception:
                 pass
+        # Atomic write: temp file + rename
         import tempfile
         tmp = tempfile.NamedTemporaryFile(mode="w", dir=str(outdir), suffix=".tmp", delete=False)
         try:
@@ -1105,7 +1234,8 @@ class Validator:
                             weights: dict[str, float], sources: dict[str, str] = None,
                             curve_data: dict[str, dict] = None,
                             pause_reasons: list = None,
-                            round_report: dict = None) -> dict:
+                            round_report: dict = None,
+                            refiner_block: dict = None) -> dict:
         """Build signed attestation bundle for R2 publishing."""
         baselines, code_hashes, sources_by_hash = self._baselines_and_hashes(sources, curve_data)
         submissions = {}
@@ -1135,9 +1265,14 @@ class Validator:
             "code_hashes": code_hashes,
             "frontier_rewards": getattr(self, "_last_frontier_rewards", {}),
         }
+        if refiner_block:
+            bundle["refiner_task"] = refiner_block   # signed
         if pause_reasons:
+            # §2.4 audit record: B200 capacity-delay / outage pauses this round.
+            # Part of the SIGNED payload (not in _SIGNING_EXCLUDE) → tamper-evident.
             bundle["pause_reasons"] = list(pause_reasons)
         if round_report:
+            # Signed selection/lifecycle evidence. Contains no optimizer source.
             bundle["fsm_report"] = round_report
             bundle["selection"] = {
                 "rule": round_report.get("selection_rule", ""),
@@ -1148,6 +1283,7 @@ class Validator:
             bundle["deferred"] = list(round_report.get("deferred", []) or [])
         if sources_by_hash:
             bundle["sources"] = sources_by_hash
+        # Sign over bundle WITHOUT sources/signature for lighter verification
         payload = _signing_payload(bundle)
         bundle["bundle_hash"] = hashlib.sha256(payload).hexdigest()
         if self.wallet:
@@ -1158,7 +1294,8 @@ class Validator:
                               weights: dict[str, float], sources: dict[str, str] = None,
                               curve_data: dict[str, dict] = None,
                               pause_reasons: list = None,
-                              round_report: dict = None):
+                              round_report: dict = None,
+                              refiner_block: dict = None):
         """Publish round attestation to R2. Returns True only after durable publish.
         Publishes both full round file (with sources) and lightweight latest.json (without)."""
         bucket = settings.r2_config()["bucket"]
@@ -1168,17 +1305,21 @@ class Validator:
         try:
             bundle = self._build_attestation(round_id, results, weights, sources, curve_data,
                                              pause_reasons=pause_reasons,
-                                             round_report=round_report)
+                                             round_report=round_report,
+                                             refiner_block=refiner_block)
             s3 = settings.make_r2_client()
+            # Full round file (with sources) — fetched on demand when user clicks a submission
             body = json.dumps(bundle, indent=2, default=str)
             s3.put_object(Bucket=bucket, Key=f"rounds/{round_id}.json",
                           Body=body.encode(), ContentType="application/json")
             log.info(f"  Full round published to R2: rounds/{round_id}.json ({len(body)} bytes)")
+            # Lightweight latest.json — no source code, fetched by dashboard on load
             latest = {k: v for k, v in bundle.items() if k != "sources"}
             latest_body = json.dumps(latest, indent=2, default=str)
             s3.put_object(Bucket=bucket, Key="latest.json",
                           Body=latest_body.encode(), ContentType="application/json")
             log.info(f"  latest.json updated ({len(latest_body)} bytes)")
+            # Publish dashboard.json — aggregated leaderboard + round history for the dashboard
             self._publish_dashboard_json(s3, bucket, round_id, bundle)
             return True
         except Exception as e:
@@ -1201,6 +1342,7 @@ class Validator:
                                 or audit_dir / "validator_state.json"),
                 audit_dir=audit_dir,
             )
+            # snapshot.json is one atomic object containing both browser feeds.
             for key, value in (("dashboard.json", snapshot["dashboard"]),
                                ("cloud-status.json", snapshot["cloud"]),
                                ("snapshot.json", snapshot)):
@@ -1214,6 +1356,7 @@ class Validator:
                         type(exc).__name__)
             return False
 
+# Attestation Validator (lightweight, no GPU)
 
 class AttestationValidator:
     """Lightweight validator that trusts a core validator's attestation from R2.
@@ -1243,6 +1386,10 @@ class AttestationValidator:
             raise ValueError("trusted_hotkey is required — without it, any keypair can set arbitrary weights. "
                              "Set --trusted-hotkey or TRUSTED_VALIDATOR_HOTKEY env var.")
         self.poll_interval = poll_interval
+        # Match Validator semantics: --set-weights gates the actual on-chain write.
+        # CLI prints a warning when the flag is omitted (__main__.py:_run_attest), but
+        # prior to this fix `run()` ignored the flag and always wrote weights — which
+        # made the warning misleading and prevented dry-run / verify-only operation.
         self.set_weights_enabled = set_weights
         self._state_file = Path(__file__).resolve().parent / "attest_state.json"
         self.last_round_id = self._load_last_round_id()
@@ -1273,6 +1420,7 @@ class AttestationValidator:
             pass
         except Exception as e:
             log.debug(f"  latest.json fetch failed, falling back to listing: {e}")
+        # Fallback: list rounds/ (for validators that haven't published latest.json yet)
         try:
             resp = s3.list_objects_v2(Bucket=self.r2_bucket, Prefix="rounds/",
                                       MaxKeys=1000)
@@ -1297,11 +1445,15 @@ class AttestationValidator:
         if self.trusted_hotkey and validator_hk != self.trusted_hotkey:
             log.warning(f"Attestation from untrusted hotkey {validator_hk[:16]}")
             return False
+        # Reconstruct payload by excluding non-signed fields (matches _build_attestation)
         payload = _signing_payload(bundle)
         actual_hash = hashlib.sha256(payload).hexdigest()
         if actual_hash != bundle_hash:
             log.warning(f"Bundle hash mismatch: expected {bundle_hash[:16]}, got {actual_hash[:16]}")
             return False
+        # Reject stale attestations. Rounds run on a 24h cadence, so anything
+        # older than 3 round periods means the core validator has been down for
+        # days — stop propagating its weights.
         ts = bundle.get("timestamp", 0)
         age = time.time() - ts
         max_age = 3 * 24 * 3600
@@ -1361,6 +1513,7 @@ class AttestationValidator:
                         self._save_last_round_id(round_id)
                     else:
                         log.warning(f"  Attestation verification failed for {round_id}")
+                # Epoch-cadence refresh between rounds (vtrust).
                 if (self.set_weights_enabled and last_weights
                         and time.time() - last_set_ts >= WEIGHT_REFRESH_SECONDS):
                     log.info("  Re-setting last verified weights (epoch refresh)")
@@ -1372,6 +1525,7 @@ class AttestationValidator:
             time.sleep(self.poll_interval)
 
 
+# Leaderboard
 
 def load_leaderboard(rounds_dir: str = None, ema_alpha: float = 0.3) -> list[dict]:
     """Aggregate round results into a ranked leaderboard."""
@@ -1394,17 +1548,23 @@ def load_leaderboard(rounds_dir: str = None, ema_alpha: float = 0.3) -> list[dic
         hashes = rd.get("code_hashes", {})
         results = rd.get("results", {})
 
+        # Support both old format (results dict with ScoreRecord fields) and
+        # new format (submissions dict with nested score object).
+        # Must resolve BEFORE decay check so present_keys is accurate.
         subs = rd.get("submissions", {})
         if not results and subs:
             results = {hk: s.get("score", s) for hk, s in subs.items()}
 
+        # Decay EMA for all existing entries not present this round.
+        # Only decay when code_hashes is available — without it, keys fall back to
+        # hotkeys which don't match code_hash-keyed entries, causing incorrect decay.
         if hashes:
             present_keys = set()
             for hk in results:
                 present_keys.add(hashes.get(hk, hk))
             for key, e in entries.items():
                 if key not in present_keys:
-                    e["ema_score"] *= (1 - ema_alpha)
+                    e["ema_score"] *= (1 - ema_alpha)  # decay toward 0
 
         for hk, res in results.items():
             key = hashes.get(hk, hk)
@@ -1480,7 +1640,8 @@ def export_optimizer(rank: int = 1, output: str = None, rounds_dir: str = None):
         return None
 
     target_hash = board[rank - 1]["code_hash"]
-    for f in sorted(rdir.glob("*.json"), reverse=True):
+    # Search round files for the source code matching this hash
+    for f in sorted(rdir.glob("*.json"), reverse=True):  # newest first
         try:
             rd = json.loads(f.read_text())
         except Exception:

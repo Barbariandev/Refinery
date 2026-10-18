@@ -64,6 +64,8 @@ log = logging.getLogger("sn125.publisher")
 DEFAULT_INTERVAL_S = 60.0
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_DIR_PATTERNS = ("*.json", "*.jsonl", "*.log", "*.md")
+# Audit dir: per-round JSONL + text, all_rounds.*, and the rotating process
+# logs (``validator.log``, ``validator.log.1`` ...).
 AUDIT_PATTERNS = ("*.jsonl", "*.log", "*.log.[0-9]*")
 
 _CONTENT_TYPES = {
@@ -75,7 +77,7 @@ _CONTENT_TYPES = {
 
 
 def _content_type(path: Path) -> str:
-    if ".log." in path.name:
+    if ".log." in path.name:          # rotated process log backup
         return "text/plain"
     return _CONTENT_TYPES.get(path.suffix, "application/octet-stream")
 
@@ -154,6 +156,7 @@ class R2Sink:
                     CacheControl="no-cache",
                 )
             except Exception as exc:
+                # SDK messages may include request details; the report is mirrored.
                 failures[key] = type(exc).__name__
         return failures
 
@@ -233,6 +236,7 @@ class ContinuousPublisher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+    # ── scanning ─────────────────────────────────────────────────────────
 
     def scan(self) -> dict[str, Path]:
         """Map of publish key -> existing local file across all roots."""
@@ -260,6 +264,7 @@ class ContinuousPublisher:
         except OSError:
             return None
 
+    # ── sync cycle ───────────────────────────────────────────────────────
 
     def publish_once(self) -> dict[str, Any]:
         """One sync cycle: upload every file whose fingerprint changed, per sink.
@@ -274,6 +279,7 @@ class ContinuousPublisher:
                     self.prepare()
                     report["dashboard_snapshot"] = {"ok": True}
                 except Exception as exc:
+                    # Keep retrying without blocking raw round/audit replication.
                     report["dashboard_snapshot"] = {"ok": False, "error": type(exc).__name__}
                     log.warning("dashboard snapshot build failed: %s", type(exc).__name__)
             files = self.scan()
@@ -314,6 +320,7 @@ class ContinuousPublisher:
                                     sink_report["last_error"])
                 report["sinks"][sink.name] = sink_report
         except Exception as exc:
+            # Absolute backstop: a publisher bug must not escape to the caller.
             report["error"] = f"{type(exc).__name__}: {exc}"
             log.warning("publisher cycle failed: %s", exc)
 
@@ -333,6 +340,7 @@ class ContinuousPublisher:
         except Exception:
             pass
 
+    # ── lifecycle ────────────────────────────────────────────────────────
 
     def start(self) -> None:
         if self._thread is not None:
@@ -364,6 +372,7 @@ class ContinuousPublisher:
         if flush:
             self.publish_once()
 
+    # ── construction ─────────────────────────────────────────────────────
 
     @classmethod
     def from_validator(cls, validator, env: dict[str, str] | None = None
@@ -409,8 +418,14 @@ class ContinuousPublisher:
                           or audit_dir / "validator_state.json")
         roots = [
             WatchRoot("rounds", rounds_dir, ("*.json",)),
+            # Per-round audit JSONL/text, the all-rounds logbook, and the rotating
+            # process logs (validator.log, autoupdate.log and their .log.N backups).
             WatchRoot("audit", audit_dir, AUDIT_PATTERNS),
             WatchRoot("cloud", pkg_dir / "cloud_status.json"),
+            # Durable operator state: the payment ledger (every credit, debit,
+            # refund and carried remainder) and the inter-round checkpoint
+            # (deferred queue, round counter, last weights). Mirroring them
+            # means a dead box loses no miner balance and no queued submission.
             WatchRoot("payments", ledger_path),
             WatchRoot("state", state_path),
         ]
@@ -443,6 +458,9 @@ class ContinuousPublisher:
         }
 
         def prepare():
+            # Two derived feeds, built independently so a bug in one never
+            # blocks the other: the public dashboard contract and the private
+            # miner-operations view (credits, queue, live round, logbook).
             errors = []
             try:
                 write_snapshot(snapshot_dir, build_snapshot(
@@ -464,5 +482,7 @@ class ContinuousPublisher:
         roots.append(WatchRoot(OPS_DIRNAME, ops_dir, ("*.json",)))
         publisher = cls(roots, sinks, interval_s=interval_s, max_bytes=max_bytes,
                         state_path=audit_dir / "publisher_state.json", prepare=prepare)
+        # The state file is itself an artifact: publish it so operators can see
+        # publisher health from the mirrors alone.
         publisher.roots.append(WatchRoot("publisher", publisher.state_path))
         return publisher

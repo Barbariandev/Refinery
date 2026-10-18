@@ -54,7 +54,7 @@ def start_payment_watcher(
                     on_sync(n)
             except FeeNotPinnedError:
                 log.debug("payment watcher idle: no fee in force yet")
-            except Exception as e:
+            except Exception as e:  # keep scanning; the registry rolled back
                 log.warning("payment watcher scan failed (retry in %.0fs): %s",
                             interval_s, e)
             if stop.wait(interval_s):

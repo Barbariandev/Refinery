@@ -1,5 +1,5 @@
 """SN125 — Training harness: types, training loop, isolation, self-test."""
-import ast, math, time, json, copy, os, signal, sys, tempfile, logging, itertools
+import ast, stat, math, time, json, copy, os, signal, sys, tempfile, logging, itertools
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, asdict
 
@@ -24,6 +24,7 @@ def _progress_event(event: str, **fields) -> None:
         pass
 
 
+# Production determinism
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 from . import settings
@@ -38,22 +39,34 @@ from .references import (
     extract_hparams, extract_capabilities,
 )
 
+# Training Harness
 
 @dataclass
 class TaskSpec:
     task_id: str
-    model_config: str
-    parameter_count: str
+    model_config: str       # HF model config name
+    parameter_count: str    # display only, e.g. "125M"
     total_steps: int
     batch_size: int
     sequence_length: int
     eval_every: int
     eval_sequences: int
     warmup_fraction: float
+    # V23: per-task wall-clock budget. If >0, the harness stops training when
+    # time.time() - t0 >= compute_budget_seconds, regardless of total_steps.
+    # `total_steps` becomes an upper bound; data loader cycles via step % len(train_data).
+    # Set to 0 (default) to fall back to step-based training (tests / tooling).
     compute_budget_seconds: float = 0.0
     task_weight: float = 1.0
-    use_pretrained: bool = False
+    use_pretrained: bool = False  # load pretrained weights vs random init
+    # WSD decay tail as a fraction of total_steps, imposed by the harness for ALL
+    # submissions (a fully-decayed schedule; see config.py, replication-noise basis). 0.0 = legacy warmup-then-constant.
     decay_fraction: float = 0.0
+    # Data identity (S1): dataset ref and, for hash-pinned shard datasets, the
+    # MANIFEST hash. Both are part of task_signature() — a task on different
+    # data is a different task; every stored reference for the old one is stale.
+    # "fineweb-edu" = legacy streaming path (back-compat default matching old
+    # round JSONs); "fineweb-edu-shards" = production pinned shards (sn125.fineweb).
     dataset: str = "fineweb-edu"
     data_manifest: str = ""
     stop_at_total_steps: bool = False
@@ -63,23 +76,28 @@ class TrainingCurve:
     task_id: str
     lr: float
     wd: float
-    eval_points: list[tuple[int, float, float]]
-    train_points: list[tuple[int, float]]
+    eval_points: list[tuple[int, float, float]]   # (step, eval_loss, wall_t)
+    train_points: list[tuple[int, float]]  # (step, train_loss) — sampled at same steps
     wall_seconds: float = 0.0
-    state_multiplier: float = 0.0
+    state_multiplier: float = 0.0  # optimizer state bytes / param bytes (0 = unknown)
     failed: bool = False
     error: str = ""
-    step_times: list[float] = field(default_factory=list)
-    iter_times: list[float] = field(default_factory=list)
+    step_times: list[float] = field(default_factory=list)  # §3 calibration: optimizer-step-only wall seconds (telemetry)
+    iter_times: list[float] = field(default_factory=list)   # §3 calibration: FULL end-to-end per-iteration wall seconds (drives N)
+    # §6.3 audit artifacts: one record per emitted safetensors checkpoint (q25/q50/
+    # q75/final). {pct, step, eval_loss, wall_t, sha256, path}. `path` is box-local
+    # (the validator uses it to upload the blob, then strips it before publishing).
     checkpoints: list[dict] = field(default_factory=list)
+    # Refiner task telemetry (sn125.refiner.feeder.FeederStats.as_dict()); {} otherwise.
+    refiner_stats: dict = field(default_factory=dict)
 
 
 @dataclass
 class ScoreRecord:
     final_score: float
-    components: dict
-    task_scores: dict
-    best_hparams: dict
+    components: dict    # name -> value for each scoring component
+    task_scores: dict   # task_id -> per-task breakdown
+    best_hparams: dict  # task_id -> (lr, wd)
     failed_tasks: list[str] = field(default_factory=list)
 
 
@@ -102,8 +120,9 @@ def _apply_fp8_training(model: nn.Module) -> nn.Module:
     def _filter(mod: nn.Module, fqn: str) -> bool:
         if not isinstance(mod, nn.Linear):
             return False
-        if "lm_head" in fqn:
+        if "lm_head" in fqn:        # tied to embeddings / vocab dim — keep bf16
             return False
+        # FP8 tensor-core GEMM requires both inner dims divisible by 16.
         return mod.in_features % 16 == 0 and mod.out_features % 16 == 0
 
     convert_to_float8_training(model, module_filter_fn=_filter)
@@ -120,14 +139,28 @@ def _build_model(config_name: str, seed: int, dtype: torch.dtype = None,
     gradient_checkpointing=True: trade compute for memory (needed for >2B models).
     fp8=True: DIAG — swap Linear layers to torchao Float8 training (master weights
     stay bf16; FP8 only inside the forward GEMM — see _apply_fp8_training)."""
+    # Allowlist: only load models we've audited. trust_remote_code=True runs arbitrary
+    # Python from the HF repo — a compromised repo could take over the validator process.
     _ALLOWED_MODELS = {"HuggingFaceTB/SmolLM2-135M", "HuggingFaceTB/SmolLM2-360M",
                         "HuggingFaceTB/SmolLM2-1.7B", "Qwen/Qwen3-4B", "Qwen/Qwen3-0.6B", "gpt2"}
+    # "forge-llama-1b": a fully-inline ~1.24B Llama config matching Llama-3.2-1B's
+    # architecture (the canonical 1B), built WITHOUT fetching any HF repo or
+    # trust_remote_code — every hyperparameter is specified here, so it is as
+    # auditable as source. Lets the 1B-Chinchilla feasibility question (operator
+    # directive B) be measured on B200 directly instead of extrapolated, without
+    # adding an un-audited gated/remote repo to the trust surface.
     _LOCAL_CONFIGS = {"forge-llama-1b"}
+    # Lean, dependency-free LLaMA-style substrate (sn125/lean_model.py): nanoGPT-spirit,
+    # modern components, fused chunked LM-head+CE that never materializes the full
+    # (B*S,vocab) logits — the fix for the HF-path isolated-worker OOM. Also inline-audited
+    # (no HF repo / trust_remote_code), so it doesn't expand the trust surface.
     from .lean_model import LEAN_CONFIGS, build_lean_model
     _LEAN = set(LEAN_CONFIGS)
     if config_name not in _ALLOWED_MODELS and config_name not in _LOCAL_CONFIGS and config_name not in _LEAN:
         raise ValueError(f"Model {config_name!r} not in allowed list: "
                          f"{_ALLOWED_MODELS | _LOCAL_CONFIGS | _LEAN}")
+    # SN125_FORCE_GC: force gradient checkpointing on regardless of the flash gc-policy
+    # (env-gated so it crosses the sandbox boundary into the scoring worker).
     if os.environ.get("SN125_FORCE_GC"):
         gradient_checkpointing = True
     if config_name in _LEAN:
@@ -162,6 +195,8 @@ def _build_model(config_name: str, seed: int, dtype: torch.dtype = None,
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.cuda()
     if fp8:
+        # After .cuda() (the swap reads layer dims, not values) and before any
+        # compile/warm-up so the FP8 modules are part of the captured graph.
         _apply_fp8_training(model)
     model.train()
     return model
@@ -189,6 +224,10 @@ def _load_real_data(dataset_name: str, seq_len: int, batch_size: int,
     """
     if dataset_name == "fineweb-edu-shards":
         from .fineweb import shard_batch_sequence
+        # Tokenization is frozen in the shards; tokenizer_name is ignored by
+        # construction (manifest pins the tokenizer — SmolLM2 family only).
+        # Lazy by construction (§4.3): a 760k-step real-data run materializes one
+        # batch at a time, never the full list — same CRN order as the eager path.
         return shard_batch_sequence(None, split=split, batch_size=batch_size,
                                     num_batches=num_batches, seed=seed, seq_len=seq_len)
 
@@ -200,7 +239,7 @@ def _load_real_data(dataset_name: str, seq_len: int, batch_size: int,
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
-    needed_tokens = num_batches * batch_size * seq_len + seq_len
+    needed_tokens = num_batches * batch_size * seq_len + seq_len  # small buffer
 
     if "fineweb" in dataset_name.lower():
         ds = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT",
@@ -220,11 +259,13 @@ def _load_real_data(dataset_name: str, seq_len: int, batch_size: int,
             if len(all_ids) >= needed_tokens:
                 break
     else:
+        # Legacy wikitext path
         ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
         texts = [r["text"] for r in ds if len(r["text"].strip()) > 20]
         random.Random(seed).shuffle(texts)
         all_ids = tok.encode("\n".join(texts), add_special_tokens=False)
 
+    # Pad if needed
     if not all_ids:
         raise ValueError(f"Dataset yielded 0 tokens (dataset={dataset_name}, seed={seed})")
     if len(all_ids) < needed_tokens:
@@ -291,10 +332,17 @@ def _chunked_ce_loss(logits: torch.Tensor, input_ids: torch.Tensor,
     no graph is kept, so tiles are summed directly. This is harness forward-only
     code; it never crosses the optimizer-isolation IPC boundary."""
     import torch.utils.checkpoint as _cp
+    # Causal shift: logit at position t predicts token t+1. Rather than slice
+    # ``logits[:, :-1, :]`` (non-contiguous -> ``reshape`` forces a full
+    # ~vocab·B·S·2-byte COPY of every logit, which itself OOMs at b64), we flatten
+    # the *contiguous* full logit tensor as a free view and build a shifted label
+    # vector whose last-of-sequence rows are ``ignore_index``. Those rows then
+    # contribute 0 to the sum and are excluded from the token count -> the result
+    # is byte-identical to dropping the last logit row, with zero extra alloc.
     bsz, seq, vocab = logits.shape
-    flat_logits = logits.reshape(-1, vocab)
+    flat_logits = logits.reshape(-1, vocab)          # free view (logits contiguous)
     shifted = input_ids.new_full((bsz, seq), ignore_index)
-    shifted[:, :-1] = input_ids[:, 1:]
+    shifted[:, :-1] = input_ids[:, 1:]               # target[b,s]=tok[b,s+1]; s=S-1 -> ignore
     flat_labels = shifted.reshape(-1)
     n = flat_logits.size(0)
     n_chunks = max(1, min(n_chunks, n))
@@ -342,14 +390,15 @@ def train_and_eval(
     max_step_time: float = 10.0,
     max_grad_norm: float = 1.0,
     use_amp: bool = False,
-    max_total_time: float = 1200.0,
+    max_total_time: float = 1200.0,  # 20 min total wall time limit
     extra_config: dict = None,
-    compute_budget_seconds: float = 0.0,
-    decay_fraction: float = 0.0,
-    checkpoint_out: str = "",
-    empty_cache_every: int = 0,
-    chunked_ce: int = 0,
-    stop_at_total_steps: bool = False,
+    compute_budget_seconds: float = 0.0,  # 0 = no budget (use total_steps)
+    decay_fraction: float = 0.0,  # WSD decay tail as a fraction of total_steps (0 = warmup-then-constant)
+    checkpoint_out: str = "",  # §6.2: export final weights as safetensors for the clean-box scorer
+    empty_cache_every: int = 0,  # per-step torch.cuda.empty_cache() cadence; 0 = off (boundary-only)
+    chunked_ce: int = 0,  # DIAG: >0 = tile cross-entropy into N chunks (frees fp32-logits mem); 0 = stock HF loss
+    stop_at_total_steps: bool = False,  # budget mode: also stop at the pinned horizon (TaskSpec.stop_at_total_steps)
+    lesson_feeder=None,  # Refiner task: sn125.refiner.feeder.LessonFeeder supplies (ids, weights) per step
 ) -> TrainingCurve:
     """Run one training job, return the eval loss curve.
     use_amp: enable bf16 autocast for forward/backward (needed for large models).
@@ -363,6 +412,11 @@ def train_and_eval(
     step() runs.  This prevents CUDA kernels submitted by the miner from scanning
     GPU memory to find the evaluation set.
     """
+    # Production now defaults to the fast kernel regime.  Exact replay can still
+    # be forced for tests/forensics with SN125_FORCE_DETERMINISM=1; otherwise
+    # Blackwell/Hopper should use flash/mem-efficient SDP and non-deterministic
+    # kernels where PyTorch chooses them.  The audit artifact is the checkpoint
+    # trajectory, not bit-exact kernel replay.
     _force_det = bool(os.environ.get("SN125_FORCE_DETERMINISM"))
     if _force_det and not os.environ.get("SN125_DIAG_NONDET"):
         torch.use_deterministic_algorithms(True, warn_only=False)
@@ -377,14 +431,32 @@ def train_and_eval(
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
 
+    # SN125_CHUNKED_CE: tile the cross-entropy (frees the transient fp32-logits cast,
+    # ~12.9GB at batch32/seq2048/vocab49152). The isolated scoring worker runs no_gc+flash,
+    # so that fp32-logits spike is the dominant allocation AND its repeated alloc/free
+    # physically fragments device memory → a later small cudaMalloc fails amid free VRAM
+    # (genesis smoke OOM). chunked-CE removes the spike; loss/grads are bit-identical
+    # (verified <1e-4, throughput-thread test_chunked_ce). Env-gated so it crosses the
+    # sandbox without a task-signature change; default 0 (off) keeps the test suite exact.
     _env_cce = int(os.environ.get("SN125_CHUNKED_CE", "0") or "0")
     if _env_cce > 0 and not chunked_ce:
         chunked_ce = _env_cce
 
+    # SN125_EMPTY_CACHE_EVERY: re-enable the per-N-step torch.cuda.empty_cache() the
+    # isolated path disables for throughput. no_gc churns large per-layer activation
+    # tensors every step → physical device-memory fragmentation → a small cudaMalloc
+    # fails amid free VRAM (genesis OOM). Periodic empty_cache returns cached blocks to
+    # the driver so it can coalesce. Env-gated; default keeps the throughput regime.
     _env_ec = int(os.environ.get("SN125_EMPTY_CACHE_EVERY", "0") or "0")
     if _env_ec > 0 and not empty_cache_every:
         empty_cache_every = _env_ec
 
+    # ── GPU memory isolation: keep all data on CPU, move one batch at a time ──
+    # This is the primary defense against CUDA-level memory scanning attacks:
+    # miner kernels execute during opt.step() when NO data tensors are on GPU.
+    # A ShardBatchSequence is already lazy + CPU-resident by construction; do NOT
+    # list-comprehend it here or we'd materialize all N batches in host RAM and
+    # defeat the §4.3 streaming guarantee. Eager lists still get the CPU guard.
     def _cpu_guard(d):
         if d.__class__.__name__ == "ShardBatchSequence":
             return d
@@ -392,6 +464,10 @@ def train_and_eval(
     train_data = _cpu_guard(train_data)
     eval_data = _cpu_guard(eval_data)
 
+    # Device-agnostic execution: derive the compute device from the model so the
+    # full train/eval/budget-stop path runs unchanged on CPU (SPEC §9 budget-stop
+    # regression test + CPU-only CI). torch.cuda.* memory accounting is a no-op
+    # off-GPU; the optimizer-memory caps only ever bind on CUDA (0 elsewhere).
     device = next(model.parameters()).device
     is_cuda = device.type == "cuda"
     def _mem_allocated():
@@ -426,6 +502,11 @@ def train_and_eval(
         ))
         _offset += _n
 
+    # NOTE: the learning-rate schedule is owned by the SUBMISSION. The harness
+    # applies updates at scale 1.0; step() receives step_number every call and
+    # config carries total_steps / warmup_steps / decay_fraction so the optimizer
+    # can implement WSD (see wsd_schedule_scale for the reference shape) or any
+    # other schedule internally.
     config = {"total_steps": total_steps, "warmup_steps": warmup_steps, "max_grad_norm": max_grad_norm,
               "decay_fraction": decay_fraction, "_device": str(device),
               "_warmup_applied_externally": False, "_schedule_applied_externally": False}
@@ -462,9 +543,12 @@ def train_and_eval(
     def _interval_due(interval: int, step_number: int) -> bool:
         return bool(interval and step_number % interval == 0)
 
+    # Memory limits: optimizer state + computation temporaries ≤ 6x parameter memory (at f32).
+    # Breakdown: 2x for state (m, v), 3-4x for peak temporaries during step().
+    # Uses param_count × 4 (f32 equiv) because optimizer states are f32 even for bf16 models.
     param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
     param_bytes_f32 = sum(p.numel() for p in model.parameters()) * 4
-    max_optimizer_mem = param_bytes_f32 * 200 + 500 * 1024 * 1024
+    max_optimizer_mem = param_bytes_f32 * 200 + 500 * 1024 * 1024  # relaxed for 50k+ step research runs (CUDA fragmentation accumulates over 30k+ steps)
     mem_before_opt = _mem_allocated()
 
     try:
@@ -494,16 +578,23 @@ def train_and_eval(
         return TrainingCurve("", lr, weight_decay, eval_points, train_points,
                              wall_seconds, failed=True, error=error)
 
+    # Scoring-integrity tripwire: __init__ must not monkey-patch trusted torch
+    # state that the harness's loss/eval path reads. Trip → disqualify (+ heal).
     _tamper = check_torch_tamper(restore=True)
     if _tamper:
         return _fail_curve([], [], 0.0,
                            f"Optimizer tampered with torch global state in __init__: {_tamper}")
 
+    # Check optimizer didn't blow memory on init
     opt_init_mem = _mem_allocated() - mem_before_opt
     if opt_init_mem > max_optimizer_mem:
         return _fail_curve([], [], 0.0,
                            f"Optimizer state too large: {opt_init_mem/1e9:.1f}GB > {max_optimizer_mem/1e9:.1f}GB limit")
 
+    # SPEC §4.2: the graceful compute-budget stop must always fire before the hard
+    # safety kill. If a caller left max_total_time at/below the budget (e.g. the
+    # 1200s default while a 72000s budget is set), raise the safety kill to budget
+    # × 1.1 so it only catches a true hang, never a healthy full-budget run.
     if compute_budget_seconds > 0 and max_total_time < compute_budget_seconds * 1.05:
         max_total_time = compute_budget_seconds * 1.1
 
@@ -551,6 +642,9 @@ def train_and_eval(
             for i, p in enumerate(ordered_params):
                 grads.append(p.grad if p.grad is not None else _zero_like_param(i, p))
             if _param_values_available(step_number):
+                # Preserve the legacy read-only-by-convention behavior for the
+                # in-process path: param-dependent optimizers get detached clones,
+                # while no-param optimizers get the cheap empty list.
                 param_values = [p.detach().clone() for p in ordered_params]
             else:
                 param_values = []
@@ -618,22 +712,25 @@ def train_and_eval(
         _step_model = _ordered_step_model
 
     eval_curve, train_curve = [], []
-    step_times = []
-    iter_times = []
-    _prev_iter = None
-    recent_train_losses = []
+    step_times = []  # §3 calibration telemetry: optimizer-step-only wall seconds
+    iter_times = []  # §3 calibration: FULL per-iteration wall seconds (fwd+bwd+clone+empty_cache+opt.step) — the real N driver
+    _prev_iter = None  # wall-clock mark of the previous iteration start, for period measurement
+    recent_train_losses = []  # rolling window for train loss at eval points
     last_loss_val = float("nan")
-    _accum_persist = 0
-    step = -1
+    _accum_persist = 0  # accumulated persistent growth across all steps
+    step = -1  # will be overwritten by loop; -1 if total_steps=0
     completed_steps = 0
-    t0 = time.time()
+    # Refiner task: the refiner's start-up (weights load + Refiner.__init__) ran
+    # before this point and belongs to the same clock as everything else it does.
+    t0 = time.time() - float(getattr(lesson_feeder, "startup_seconds", 0.0) or 0.0)
 
+    # Budget mode also respects the schedule horizon when stop_at_total_steps is set.
     budget_mode = compute_budget_seconds > 0
     step_source = itertools.count() if budget_mode else range(total_steps)
 
     _quartiles = [0.25, 0.5, 0.75] if (budget_mode and checkpoint_out) else []
     _quartiles_done: set[float] = set()
-    _ckpt_records: list[dict] = []
+    _ckpt_records: list[dict] = []  # audit-checkpoint metadata, attached to the returned curve
 
     def _heldout_loss() -> float:
         """Fresh held-out loss at the current model state (read-only; toggles eval/train)."""
@@ -679,6 +776,10 @@ def train_and_eval(
             return
         _frac_elapsed = (time.time() - t0) / compute_budget_seconds
         if stop_at_total_steps and total_steps > 0:
+            # With the horizon cap the run can end before the wall-clock
+            # quartiles are reached; key the audit checkpoints to whichever
+            # progress axis (wall or steps) is further along so q25/q50/q75
+            # always land before the final export.
             _frac_elapsed = max(_frac_elapsed, at_step / total_steps)
         for _q in _quartiles:
             if _q not in _quartiles_done and _frac_elapsed >= _q:
@@ -694,6 +795,13 @@ def train_and_eval(
                         budget_s=float(compute_budget_seconds))
         return True
 
+    # Opt-in wall-clock heartbeat (SN125_PROGRESS): the eval-boundary [progress]
+    # print only fires every `eval_every` steps, so a long run with a huge
+    # eval_every (e.g. a 762k-step §3 confirmation) is SILENT for hours — a death
+    # mid-run leaves no trace of WHERE/WHY. This emits step/rate/loss + GPU
+    # alloc/reserved every ~60s so fragmentation growth (reserved climbing toward
+    # the card ceiling) and the last live step before a kill are both visible.
+    # Gated on the env var, so scoring boxes (which never set it) are unaffected.
     _progress = bool(os.environ.get("SN125_PROGRESS"))
     _hb_interval = float(os.environ.get("SN125_PROGRESS_INTERVAL", "60"))
     _last_hb = t0
@@ -711,6 +819,27 @@ def train_and_eval(
     _profile = bool(os.environ.get("SN125_PROFILE"))
     _prof: dict[str, float] = {}
     _prof_steps = 0
+
+    # Refiner task plumbing: the feeder may ask the student for per-token losses
+    # on window entries (read-only, eval mode, no grad); the weighted selective
+    # loss replaces the uniform LM loss. Both are no-ops on the optimizer task.
+    _refiner_tokens_trained = 0
+    if lesson_feeder is not None:
+        from .refiner.loss import token_losses as _rf_token_losses, weighted_lm_loss as _refiner_weighted_loss
+
+        def _refiner_score_fn(ids_cpu: torch.Tensor) -> torch.Tensor:
+            model.eval()
+            try:
+                with torch.no_grad():
+                    _g = ids_cpu.to(device, non_blocking=is_cuda)
+                    with torch.amp.autocast(device.type, dtype=torch.bfloat16) if use_amp else nullcontext():
+                        _l = _rf_token_losses(model, _g)
+                    return _l.detach().float().cpu()
+            finally:
+                model.train()
+    else:
+        _refiner_score_fn = None
+        _refiner_weighted_loss = None
 
     @contextmanager
     def _phase(name: str):
@@ -730,10 +859,18 @@ def train_and_eval(
     for step in step_source:
         if _budget_exhausted():
             break
+        # FULL-iteration period: wall-clock between consecutive iteration starts.
+        # This captures the TRUE per-step cost (forward + .item() sync + backward +
+        # the full param/grad cloning + per-step empty_cache + opt.step + tamper/mem
+        # checks + apply-updates) — i.e. exactly what bounds how many steps fit the
+        # 20h budget. `step_times` below measures ONLY opt.step(), which on a B200 is
+        # ~36× smaller for a 0.6B/seq2048 deterministic (MATH-backend) run, so it must
+        # NOT be used to size N (doing so inflated N ~36× in the first calibration).
         _now = time.time()
         if _prev_iter is not None:
             iter_times.append(_now - _prev_iter)
         _prev_iter = _now
+        # Eval checkpoint — move eval batches to GPU one at a time, delete immediately
         if step % eval_every == 0:
             model.eval()
             with torch.no_grad():
@@ -755,6 +892,8 @@ def train_and_eval(
                             rate_steps_per_s=float(step / _elapsed)
                             if step > 0 and _elapsed > 0 else 0.0)
             if os.environ.get("SN125_PROGRESS"):
+                # Opt-in step-rate telemetry for remote boxes (diagnosing sick/slow
+                # boxes needs the rate mid-run, not just the final curve).
                 _el = _elapsed
                 _rate = step / _el if step > 0 and _el > 0 else 0.0
                 print(f"    [progress] step {step}/{total_steps} eval_loss={eval_loss:.4f} "
@@ -766,17 +905,40 @@ def train_and_eval(
                 train_curve.append((step, eval_loss))
             model.train()
 
+        # §6.3 quartile audit checkpoints at 25/50/75% of the wall-clock budget.
+        # Checked after completed updates; slow steps/evals can cross several boundaries.
         _check_quartiles(step)
 
+        # Evaluation and checkpointing consume the same budget as training.
         if _budget_exhausted():
             break
 
-        if not train_data:
-            return _fail_curve(eval_curve, train_curve, time.time() - t0, "No training data")
-        gpu_batch = train_data[step % len(train_data)].to(device, non_blocking=is_cuda)
+        # Train step — move single batch to GPU, delete before opt.step()
+        if lesson_feeder is not None:
+            # Refiner task: the planner decides what this step trains on. Plan
+            # calls, signal scoring and materialization all run on this clock.
+            try:
+                with _phase("feeder"):
+                    _ids, _w = lesson_feeder.next_batch(
+                        step=step, elapsed_s=time.time() - t0,
+                        tokens_trained=_refiner_tokens_trained, score_fn=_refiner_score_fn)
+            except Exception as _fe:
+                return _fail_curve(eval_curve, train_curve, time.time() - t0,
+                                   f"refiner failed at step {step}: {type(_fe).__name__}: {_fe}")
+            gpu_batch = _ids.to(device, non_blocking=is_cuda)
+            gpu_w = _w.to(device, non_blocking=is_cuda)
+            _refiner_tokens_trained += int((_w > 0).sum())
+        else:
+            if not train_data:
+                return _fail_curve(eval_curve, train_curve, time.time() - t0, "No training data")
+            gpu_batch = train_data[step % len(train_data)].to(device, non_blocking=is_cuda)
+            gpu_w = None
         with _phase("forward"):
             with torch.amp.autocast(device.type, dtype=torch.bfloat16) if use_amp else nullcontext():
-                loss = _model_loss(model, gpu_batch, chunked_ce)
+                if gpu_w is not None:
+                    loss = _refiner_weighted_loss(model, gpu_batch, gpu_w)
+                else:
+                    loss = _model_loss(model, gpu_batch, chunked_ce)
             sample_train_loss = _interval_due(train_loss_interval, step)
             if sample_train_loss:
                 loss_val = loss.detach().float().item()
@@ -787,14 +949,17 @@ def train_and_eval(
                 recent_train_losses.append(loss_val)
         with _phase("backward"):
             loss.backward()
-        del gpu_batch, loss
+        del gpu_batch, gpu_w, loss
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
+        # Updates are applied at scale 1.0 — the submission owns its own LR
+        # schedule (it gets step_number each call and the horizon in config).
         warmup_scale = 1.0
 
         if _step_model is None:
             param_values_available = _param_values_available(step)
+            # Build gradient + param dicts — these are detached copies, safe to pass
             with _phase("grad_clone"):
                 gradients, param_values = {}, {}
                 for name, p in model.named_parameters():
@@ -846,6 +1011,9 @@ def train_and_eval(
         if _step_error:
             return _fail_curve(eval_curve, train_curve, time.time() - t0, _step_error)
 
+        # Scoring-integrity tripwire: step() must not monkey-patch trusted torch
+        # state. Checked BEFORE the harness applies updates (p.add_) or runs the
+        # next eval, so a faked loss read / corrupted update is never trusted.
         if _interval_due(tamper_check_interval, step):
             _tamper = check_torch_tamper(restore=True)
             if _tamper:
@@ -880,6 +1048,11 @@ def train_and_eval(
             return _fail_curve(eval_curve, train_curve, time.time() - t0,
                                f"Total time {time.time()-t0:.0f}s > {max_total_time}s limit")
 
+        # Per-step memory check: catch both large temporaries AND slow persistent leaks.
+        # Track accumulated persistent growth across steps (old check only saw per-step
+        # delta, missing e.g. 10MB/step * 4000 steps = 40GB).
+        # Sync required: CUDA ops are async — without sync, peak stats may not reflect
+        # pending kernel allocations, letting adversarial optimizers exceed the limit.
         if memory_check_due and is_cuda:
             torch.cuda.synchronize()
         if memory_check_due:
@@ -893,12 +1066,14 @@ def train_and_eval(
                 return _fail_curve(eval_curve, train_curve, time.time() - t0,
                                    f"Optimizer memory peaked at {total_opt_mem/1e9:.1f}GB > {max_optimizer_mem/1e9:.1f}GB limit at step {step}")
 
+        # Apply updates; check type, shape, NaN (adversarial or buggy optimizers)
         if not _updates_applied:
             target_params, update_tensors, update_names = [], [], []
             with torch.no_grad():
                 for name, p in model.named_parameters():
                     if name in updates:
                         u = updates[name]
+                        # Defense-in-depth: reject Tensor subclasses that could override __add__
                         if type(u) is not torch.Tensor:
                             u = torch.as_tensor(u)
                         if u.device != p.device:
@@ -927,6 +1102,7 @@ def train_and_eval(
                             p.add_(u * warmup_scale)
 
         completed_steps = step + 1
+        # Finish validation and application of an in-flight update before stopping.
         if _budget_exhausted():
             break
         if budget_mode and stop_at_total_steps and total_steps > 0 and completed_steps >= total_steps:
@@ -937,6 +1113,8 @@ def train_and_eval(
                             budget_s=float(compute_budget_seconds))
             break
 
+    # Final eval — same CPU->GPU->delete pattern
+    # Use actual step reached (may be < total_steps if compute_budget_seconds cut early)
     final_step = completed_steps
     if is_cuda:
         torch.cuda.reset_peak_memory_stats()
@@ -956,6 +1134,8 @@ def train_and_eval(
                     eval_loss=float(eval_loss),
                     elapsed_s=float(time.time() - t0))
 
+    # §3 per-phase profiler emit (SN125_PROFILE) — one machine-parseable line the
+    # throughput probe parses to report forward/backward/opt/clone split + MFU.
     if _profile and _prof_steps > 0:
         per_step = {k: round(v / _prof_steps, 6) for k, v in _prof.items()}
         print("PROFILE_BREAKDOWN " + json.dumps({
@@ -964,9 +1144,12 @@ def train_and_eval(
             "sum_profiled_per_step_s": round(sum(per_step.values()), 6),
         }), flush=True)
 
+    # §5 memory observability: log peak host RSS + CUDA mem at the final-eval
+    # boundary — the historical 1.7B OOM hit exactly here when the held-out set
+    # was materialized in host RAM. Opt-in (telemetry gate) so tests stay quiet.
     if os.environ.get("SN125_PROGRESS"):
         import resource
-        _rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        _rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024  # KiB→bytes on Linux
         _cmax = torch.cuda.max_memory_allocated() if is_cuda else 0
         print(f"    [mem] final-eval peak_host_rss={_rss/1e9:.2f}GB "
               f"cuda_max={_cmax/1e9:.2f}GB (n_eval_batches={len(eval_data)})", flush=True)
@@ -975,11 +1158,21 @@ def train_and_eval(
     elif train_curve:
         train_curve.append((final_step, train_curve[-1][1]))
 
+    # Refiner task: the miner's process has nothing left to do once the last
+    # batch is drawn; stop it BEFORE the final checkpoint is written so no
+    # miner code is alive while the artifact that gets scored exists on disk.
+    if lesson_feeder is not None:
+        lesson_feeder.close()
+
+    # §6.2 scoring split: the checkpoint is the ONLY artifact that leaves this
+    # box; the clean-box scorer recomputes the final eval loss from it.
     if checkpoint_out:
         from .engine.score_worker import export_checkpoint
         _final_sha = export_checkpoint(model, checkpoint_out,
                           metadata={"final_step": str(final_step),
                                     "lr": str(lr), "wd": str(weight_decay)})
+        # The final (100%) audit checkpoint. eval_loss is the last held-out point
+        # (the verifier recomputes from the blob anyway; this is reference metadata).
         _ckpt_records.append({"pct": 1.0, "step": final_step,
                               "eval_loss": (eval_curve[-1][1] if eval_curve else float("nan")),
                               "wall_t": time.time() - t0, "sha256": _final_sha,
@@ -992,13 +1185,23 @@ def train_and_eval(
                         checkpoint_path=checkpoint_out,
                         sha256=_final_sha)
 
+    # State multiplier: total persistent optimizer memory / param memory
+    # Captures both init-time and lazily-allocated state (via _accum_persist)
     _peak_opt_mem = opt_init_mem + _accum_persist
     _state_mult = _peak_opt_mem / max(param_bytes_f32, 1)
     _close_optimizer()
 
-    return TrainingCurve("", lr, weight_decay, eval_curve, train_curve, time.time() - t0,
-                         state_multiplier=max(0.0, _state_mult), step_times=step_times,
-                         iter_times=iter_times, checkpoints=_ckpt_records)
+    _curve = TrainingCurve("", lr, weight_decay, eval_curve, train_curve, time.time() - t0,
+                           state_multiplier=max(0.0, _state_mult), step_times=step_times,
+                           iter_times=iter_times, checkpoints=_ckpt_records)
+    if lesson_feeder is not None:
+        try:
+            _curve.refiner_stats = lesson_feeder.stats.as_dict()
+            _curve.refiner_stats["final_step"] = int(final_step)
+        except Exception:
+            _curve.refiner_stats = {}
+        lesson_feeder.close()
+    return _curve
 
 
 def _should_gradient_checkpoint(use_amp: bool, sequence_length: int, flash_on: bool) -> bool:
@@ -1036,22 +1239,32 @@ def evaluate_submission(
     model_cache: nn.Module | None = None,
     data_cache: tuple | None = None,
     use_amp: bool = False,
-    dataset_name: str | None = None,
+    dataset_name: str | None = None,  # None => task.dataset (first-class task data config)
     rebuild_model: bool = False,
     baseline_step_time: float | None = None,
-    max_total_time: float = 0,
-    build_dir: str = "",
-    compute_budget_seconds: float = 0.0,
-    checkpoint_out: str = "",
+    max_total_time: float = 0,  # 0 = auto-compute from steps
+    build_dir: str = "",  # path to compiled .so files for multi-language submissions
+    compute_budget_seconds: float = 0.0,  # 0 = no budget
+    checkpoint_out: str = "",  # §6.3: when set, the loop emits final + 25/50/75% quartile audit checkpoints
+    refiner_cfg: dict | None = None,  # Refiner task: {"mode": "identity"|"refiner", "source", "weights_path", ...}
 ) -> tuple[TrainingCurve, nn.Module | None, tuple]:
     """Evaluate one optimizer on one task with given hyperparams. Single run, no grid.
     Returns (curve, model_cache, data_cache).
 
     checkpoint_out: forwarded to train_and_eval. In budget mode the loop writes the
     final weights here AND quartile snapshots `{base}_q25/_q50/_q75{ext}` (each tagged
-    with held-out loss) — the audit trail the launch pipeline publishes. Empty = off."""
+    with held-out loss) — the audit trail the launch pipeline publishes. Empty = off.
+
+    refiner_cfg: when set, `source` is the (pinned, trusted) STUDENT optimizer and the
+    training batches come from a sn125.refiner LessonFeeder instead of the fixed shard
+    order: mode "identity" is the baseline packer, mode "refiner" runs the miner's
+    refiner source + safetensors weights in an isolated process. Held-out eval points
+    are still recorded (diagnostic only; the Refiner task is scored on benchmarks)."""
     if dataset_name is None:
         dataset_name = getattr(task, "dataset", "fineweb-edu")
+    # S1/§5.4: a manifest-pinned task must run on exactly the pinned shard set.
+    # A hash mismatch means the data on this box is not the task's data — the
+    # run would be unscoreable, so fail before spending any GPU time.
     if getattr(task, "data_manifest", ""):
         try:
             from .fineweb import load_manifest
@@ -1071,11 +1284,30 @@ def evaluate_submission(
     max_step = min(max_step, 30.0)
     if max_total_time <= 0:
         if compute_budget_seconds > 0:
+            # Fixed-budget regime (SPEC §4.2): the wall-clock budget is the limiter,
+            # so the hard safety kill sits just above it (budget × 1.1) rather than
+            # the step-based estimate (which is meaningless when total_steps is only
+            # an upper bound). The graceful budget stop fires first at the budget;
+            # this only catches a hang past +10%.
             max_total_time = compute_budget_seconds * 1.1
         else:
+            # Auto: 2x generous estimate (max_step * steps * 2) with 600s floor
             max_total_time = max(600.0, task.total_steps * max_step * 2)
 
     dtype = torch.bfloat16 if use_amp else None
+    # Gradient checkpointing is a MEMORY lever, decoupled from AMP. AMP-scale models need
+    # it, but so does the deterministic (no-AMP) production regime at long sequence length:
+    # seq2048 math attention materializes a per-layer (batch, heads, seq, seq) score tensor,
+    # so retaining every layer's activations peaks ~55 GB + fragmentation and OOMs an 80 GB
+    # A100. Checkpointing (use_reentrant=False) recomputes activations in backward, which is
+    # bit-identical under deterministic algorithms → SAME curve, SAME task signature, lower
+    # peak. Small dev/test configs (seq <= 512) stay uncheckpointed so the suite isn't slowed.
+    # THROUGHPUT (operator relaxed-determinism regime, 2026-06-24): when flash attention is
+    # active (SN125_DIAG_FLASH) the O(seq²) score tensor is never materialized — it is
+    # streamed — so the long-sequence memory wall above is gone and gradient checkpointing
+    # is pure ~2× recompute tax with no memory benefit. Measured: SmolLM2-360M seq2048 b32
+    # flash, no_gc 201.6 vs gc 97.4 TFLOP/s (chinchilla_frac_20h 0.924 vs 0.48). So drop gc
+    # whenever flash is on; keep it for the deterministic MATH path where the wall is real.
     gc_ckpt = _should_gradient_checkpoint(use_amp, task.sequence_length,
                                           _flash_regime_on())
     if model_cache is None and not rebuild_model:
@@ -1084,11 +1316,16 @@ def evaluate_submission(
                                    gradient_checkpointing=gc_ckpt)
 
     if data_cache is None:
+        # Sharded data is lazy (ShardBatchSequence, §4.3) → O(batch) host RAM, so a
+        # full fixed-budget run uses every distinct step; only the eager legacy/
+        # synthetic loaders (materialized lists) keep the 2000-batch OOM cap.
         if dataset_name == "fineweb-edu-shards":
             total_batches = task.total_steps + 10
         else:
-            total_batches = min(task.total_steps + 10, 2000)
+            total_batches = min(task.total_steps + 10, 2000)  # cap to avoid OOM on long runs
         eval_batches = max(1, task.eval_sequences // task.batch_size)
+        # Shard datasets carry a real held-out split (document-disjoint, §5.4);
+        # legacy streaming paths fall back to a disjoint-seed draw of "train".
         eval_split = "heldout" if dataset_name == "fineweb-edu-shards" else "train"
         train_data = _load_real_data(dataset_name, task.sequence_length, task.batch_size,
                                      total_batches, seed, tokenizer_name=task.model_config)
@@ -1126,11 +1363,36 @@ def evaluate_submission(
         except ValueError:
             step_timeout = 0.0
         if step_timeout <= 0.0:
+            # Must be below train_and_eval's parent SIGALRM so the child is
+            # killed by OptProcHandle instead of leaving cleanup to the parent.
             step_timeout = max(1.0, float(max_step))
         snapshot_updates = os.environ.get("SN125_OPTPROC_NO_SNAPSHOT", "") == ""
         return make_split_optimizer_cls(
             source, device=device_s, sandboxed=True,
             step_timeout=step_timeout, snapshot_updates=snapshot_updates)
+
+    def _make_feeder(model: nn.Module):
+        """Refiner task: build the lesson feeder (identity baseline or miner refproc)."""
+        if refiner_cfg is None:
+            return None
+        from .refiner.entries import EntryStream
+        from .refiner.feeder import make_feeder
+        device_s = str(next(model.parameters()).device)
+        stream = EntryStream(refiner_cfg.get("data_dir") or None,
+                             split=refiner_cfg.get("split", "train"),
+                             seed=int(refiner_cfg.get("seed", seed)),
+                             max_entry_tokens=int(refiner_cfg.get("max_entry_tokens", 8192)),
+                             verify=False, exclusions=refiner_cfg.get("exclusions") or None)
+        if getattr(task, "data_manifest", "") and stream.manifest_hash != task.data_manifest:
+            raise RuntimeError(f"refiner entry stream manifest {stream.manifest_hash[:16]} != "
+                               f"task pin {task.data_manifest[:16]}")
+        _ex_pin = refiner_cfg.get("exclusions_sha256") or ""
+        if _ex_pin and stream.exclusions_sha256 != _ex_pin:
+            raise RuntimeError(f"refiner exclusion list {stream.exclusions_sha256[:16]} != "
+                               f"task pin {_ex_pin[:16]}")
+        return make_feeder(stream, refiner_cfg, batch_size=task.batch_size,
+                           seq_len=task.sequence_length, budget_s=compute_budget_seconds,
+                           device=device_s)
 
     if rebuild_model:
         if model_cache is not None:
@@ -1140,7 +1402,14 @@ def evaluate_submission(
                                  use_pretrained=task.use_pretrained,
                                  gradient_checkpointing=gc_ckpt)
         run_optimizer_cls = _optimizer_cls_for_model(gpu_model)
+        feeder = None
         try:
+            try:
+                feeder = _make_feeder(gpu_model)
+            except Exception as e:
+                return (TrainingCurve(task.task_id, lr, wd, [], [], failed=True,
+                                      error=f"refiner setup failed: {type(e).__name__}: {e}"),
+                        None, data_cache)
             curve = train_and_eval(
                 gpu_model, train_data, eval_data, run_optimizer_cls,
                 lr, wd, task.total_steps, task.eval_every, warmup_steps,
@@ -1150,16 +1419,26 @@ def evaluate_submission(
                 decay_fraction=getattr(task, "decay_fraction", 0.0),
                 checkpoint_out=checkpoint_out,
                 stop_at_total_steps=bool(getattr(task, "stop_at_total_steps", False)),
+                lesson_feeder=feeder,
             )
             curve.task_id = task.task_id
         finally:
+            if feeder is not None:
+                feeder.close()
             del gpu_model
             torch.cuda.empty_cache()
         return curve, None, data_cache
     else:
         model_copy = copy.deepcopy(model_cache)
         run_optimizer_cls = _optimizer_cls_for_model(model_copy)
+        feeder = None
         try:
+            try:
+                feeder = _make_feeder(model_copy)
+            except Exception as e:
+                return (TrainingCurve(task.task_id, lr, wd, [], [], failed=True,
+                                      error=f"refiner setup failed: {type(e).__name__}: {e}"),
+                        model_cache, data_cache)
             curve = train_and_eval(
                 model_copy, train_data, eval_data, run_optimizer_cls,
                 lr, wd, task.total_steps, task.eval_every, warmup_steps,
@@ -1169,14 +1448,41 @@ def evaluate_submission(
                 decay_fraction=getattr(task, "decay_fraction", 0.0),
                 checkpoint_out=checkpoint_out,
                 stop_at_total_steps=bool(getattr(task, "stop_at_total_steps", False)),
+                lesson_feeder=feeder,
             )
             curve.task_id = task.task_id
         finally:
+            if feeder is not None:
+                feeder.close()
             del model_copy
             torch.cuda.empty_cache()
         return curve, model_cache, data_cache
 
 
+# Principled Sandbox: OS-Level Isolation
+# Security model: constrain the ENVIRONMENT, not the CODE.
+# Even fully malicious Python/CUDA/C code can't do harm because the OS prevents it:
+#   Layer 1 — Namespaces: unshare --mount --net --ipc --uts --pid --fork --mount-proc
+#     - mount: private /tmp (tmpfs), /root /home /etc /var read-only
+#     - net: no network access at all
+#     - ipc: no shared memory with validator
+#     - uts: hostname isolation
+#     - pid: can only see own processes, can't signal validator
+#     - mount-proc: private /proc (no /proc/1/cmdline or /proc/self/maps leaks)
+#   Layer 2 — Privilege drop: setuid/setgid to nobody (65534)
+#   Layer 3 — Resource limits: RLIMIT_NPROC(64), RLIMIT_FSIZE(100M),
+#     RLIMIT_AS(auto: 2*GPU VRAM + 64GB — covers CUDA VA reservation + pool + shard mmap), RLIMIT_CPU(300s)
+#   Layer 4 — Environment: sanitized env (no secrets), HF offline mode
+#   Layer 5 — Parent timeout: SIGKILL from parent after deadline
+#   Layer 6 — Result validation: shape/dtype/NaN/Inf checks on returned tensors
+# AST validation is kept as an optional fast pre-filter to reject obvious garbage
+# before burning GPU compute. It is NOT the security boundary.
+# Multi-language submissions: dict of {filename: source_code}
+#   - optimizer.py (required): Python Optimizer class
+#   - *.cu (optional): CUDA kernels compiled with nvcc inside sandbox
+#   - *.c (optional): C extensions compiled with gcc inside sandbox
+#   Compilation happens AFTER privilege drop to nobody (Phase 78).
+#   Compiled .so files placed in /tmp/sn125_build/ (mode 0777), loadable via ctypes.
 
 _SANDBOX_SETUP_SCRIPT = '''
 import os as _os, sys as _sys, subprocess as _sp, shlex as _shlex
@@ -1234,6 +1540,13 @@ _os.environ["_SN125_SANDBOX_MODE"] = "namespaces"
 '''
 
 
+# Container-host prologue (RunPod pods: no CAP_SYS_ADMIN, so no namespaces or
+# mounts). Instead of a private mount view the worker gets a per-run private
+# directory (created 0700 + chowned to nobody by the parent, path passed in
+# _SN125_RUN_DIR) for build products and compiler caches, and the seccomp
+# filter (sn125/seccomp_sandbox.py) is installed right after the privilege
+# drop. The module is imported HERE, as root, before the drop: on a dev box
+# the project may live under a 0700 home the nobody user cannot traverse.
 _SECCOMP_SANDBOX_SETUP_SCRIPT = '''
 import os as _os, sys as _sys
 from sn125 import seccomp_sandbox as _sn125_seccomp
@@ -1316,6 +1629,16 @@ if _in_sandbox:
     # Verify we're actually nobody — defense against no-op setuid
     if os.getuid() != 65534 or os.getgid() != 65534:
         _fail(f"Sandbox: priv drop verification failed: uid={os.getuid()} gid={os.getgid()}")
+    # The worker inherits the validator's cwd, which may be unreadable to nobody
+    # (e.g. a checkout under /root). Spawned helper processes (optproc/refproc
+    # use the multiprocessing spawn start method, whose bootstrap chdir()s into
+    # the parent's cwd) would then die at startup and leave the worker blocked
+    # on the spawn pipe until the run timeout. Work from the private tmpfs
+    # instead; nothing in the worker depends on a relative path.
+    try:
+        os.chdir("/tmp")
+    except Exception as _e:
+        _fail(f"Sandbox: chdir(/tmp) failed: {_e}")
     # PR_SET_NO_NEW_PRIVS: prevent regaining privileges via setuid binaries or
     # other escalation vectors. Once set, cannot be unset by the process or children.
     import ctypes as _ctypes
@@ -1466,7 +1789,8 @@ try:
         max_total_time=args.get("max_total_time", 0),
         compute_budget_seconds=args.get("compute_budget_seconds", 0.0),
         checkpoint_out=args.get("checkpoint_out", ""),
-        build_dir=_build if _has_native else "")
+        build_dir=_build if _has_native else "",
+        refiner_cfg=args.get("refiner") or None)
     sys.stdout.flush()  # flush any native code stdout before our authenticated output
     print(json.dumps({"_nonce": _nonce, "task_id": curve.task_id, "lr": curve.lr, "wd": curve.wd,
         "eval_points": curve.eval_points, "train_points": curve.train_points,
@@ -1474,6 +1798,7 @@ try:
         "checkpoints": getattr(curve, "checkpoints", []),
         "step_times": getattr(curve, "step_times", []),
         "iter_times": getattr(curve, "iter_times", []),
+        "refiner_stats": getattr(curve, "refiner_stats", {}) or {},
         # Sandbox-engagement attestation (nonce-authenticated, so miner code cannot
         # forge it): the parent verifies these when SN125_REQUIRE_SANDBOX is on.
         "sandboxed": _in_sandbox, "worker_uid": os.getuid(),
@@ -1542,8 +1867,8 @@ def _sandbox_mode() -> str:
     return settings.sandbox_mode()
 
 
-_SANDBOX_AVAILABLE = None
-_SECCOMP_SANDBOX_AVAILABLE = None
+_SANDBOX_AVAILABLE = None  # lazy init (namespaces flavour)
+_SECCOMP_SANDBOX_AVAILABLE = None  # lazy init (seccomp flavour)
 
 
 def _sandbox_required() -> bool:
@@ -1578,6 +1903,9 @@ def _enforce_sandbox_attestation(result: dict, task_id: str, lr: float, wd: floa
                f"no_new_privs={result.get('no_new_privs')!r}, "
                f"net_denied={result.get('net_denied')!r}")
     else:
+        # Namespace flavour: a worker that attests the seccomp flavour instead
+        # is NOT accepted here — the box was configured for namespaces, so a
+        # namespace-less result means the setup script was bypassed.
         if (result.get("sandboxed") is True and result.get("worker_uid") == 65534
                 and result.get("sandbox_mode") in (None, "namespaces")):
             return result
@@ -1593,8 +1921,9 @@ def _enforce_sandbox_attestation(result: dict, task_id: str, lr: float, wd: floa
                   f"engagement [{mode}] ({why}); result rejected"),
     }
 
+# cgroup v2 resource isolation
 _CGROUP_ROOT = "/sys/fs/cgroup"
-_CGROUP_AVAILABLE = None
+_CGROUP_AVAILABLE = None  # lazy init
 
 
 def _has_cgroup_v2() -> bool:
@@ -1604,9 +1933,11 @@ def _has_cgroup_v2() -> bool:
             ctrl = _f.read()
         if "memory" not in ctrl or "pids" not in ctrl:
             return False
+        # Enable controllers on subtree (idempotent)
         subtree = f"{_CGROUP_ROOT}/cgroup.subtree_control"
         with open(subtree, "w") as f:
             f.write("+memory +pids")
+        # Test: create and remove a probe cgroup
         probe = f"{_CGROUP_ROOT}/sn125_probe_{os.getpid()}"
         os.makedirs(probe, exist_ok=True)
         os.rmdir(probe)
@@ -1627,11 +1958,12 @@ def _cgroup_create(name: str, memory_max_bytes: int, pids_max: int) -> str | Non
         os.makedirs(path, exist_ok=True)
         with open(f"{path}/memory.max", "w") as f:
             f.write(str(memory_max_bytes))
+        # memory.swap.max=0 prevents swapping out to hide memory usage
         try:
             with open(f"{path}/memory.swap.max", "w") as f:
                 f.write("0")
         except (FileNotFoundError, PermissionError):
-            pass
+            pass  # swap controller may not be enabled
         with open(f"{path}/pids.max", "w") as f:
             f.write(str(pids_max))
         return path
@@ -1652,6 +1984,7 @@ def _cgroup_add_pid(cgroup_path: str, pid: int) -> bool:
 def _cgroup_cleanup(cgroup_path: str):
     """Remove a cgroup (must have no live processes)."""
     try:
+        # Kill any remaining processes first
         try:
             with open(f"{cgroup_path}/cgroup.procs") as f:
                 pids = f.read().strip()
@@ -1680,10 +2013,22 @@ def _make_safe_env() -> dict:
         "CUDA_HOME", "CUDA_PATH",
         "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH",
         "TORCH_CUDA_ARCH_LIST",
+        # Production throughput regime (operator relaxed-determinism, 2026-06-24): these
+        # two harness-controlled torch-backend toggles MUST cross the sandbox boundary or
+        # the isolated scoring path silently reverts to MATH attention, which materializes
+        # the O(seq²) score tensor and OOMs at seq2048/batch32 (the genesis-smoke failure).
+        # They only select the SDP backend / relax deterministic algorithms in harness-owned
+        # forward code — they grant the IPC-isolated optimizer no new capability, so passing
+        # them through is safe. Unset (test/default) → fully deterministic MATH, unchanged.
         "SN125_DIAG_FLASH", "SN125_DIAG_NONDET", "SN125_CHUNKED_CE", "SN125_EMPTY_CACHE_EVERY",
         "SN125_FORCE_GC", "SN125_LEAN_LOSS_CHUNKS",
         "SN125_LEAN_COMPILE", "SN125_LEAN_LOSS_CKPT",
+        # Opt-in optimizer-process isolation rollout/benchmarking. These are
+        # harness controls only; miner code does not receive secrets or network.
         "SN125_USE_OPTPROC", "SN125_OPTPROC_STEP_TIMEOUT",
+        # Harness-owned observability/data knobs. These do not expose secrets or
+        # grant miner code extra filesystem/network reach; they only let the
+        # isolated worker emit progress and find the validator-staged shard dir.
         "SN125_PROGRESS", "SN125_PROGRESS_INTERVAL", "SN125_PROFILE", "SN125_FINEWEB_DIR",
         "SN125_FORCE_DETERMINISM", "SN125_SKIP_UPDATE_FINITE",
     ])
@@ -1698,17 +2043,50 @@ def _make_safe_env() -> dict:
     safe_env["OPENBLAS_NUM_THREADS"] = "1"
     safe_env["MKL_NUM_THREADS"] = "1"
     safe_env["OMP_NUM_THREADS"] = "1"
+    # torch.compile inside the sandbox: the worker runs as nobody(65534) with a
+    # private writable /tmp but an UNWRITABLE $HOME (root's). Triton's kernel
+    # cache defaults to ~/.triton and inductor's to /tmp/torchinductor_<user> —
+    # pin both to the private tmpfs or the first compiled kernel write fails.
     safe_env["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/torchinductor"
     safe_env["TRITON_CACHE_DIR"] = "/tmp/triton_cache"
     safe_env["TRITON_HOME"] = "/tmp/triton_home"
     safe_env["XDG_CACHE_HOME"] = "/tmp/.cache"
+    # COMPILE_THREADS=1 forces synchronous in-process kernel compilation:
+    # inductor's parallel compile pool spawns subprocess workers, which is
+    # exactly the machinery the sandbox's pid-namespace + priv-drop + NPROC
+    # limits are built to constrain. Serial compile costs ~1-2 min extra warmup
+    # once per run — noise against a 20h budget — and keeps compile from
+    # depending on process-spawning inside the sandbox at all.
     safe_env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+    # Fixed CUDA allocator config (hardcoded, NOT host pass-through, so the worker env
+    # is byte-identical across boxes for audit-replay). A large model (e.g. SmolLM2-360M,
+    # seq2048, deterministic math attention) peaks at ~56 GB but the caching allocator
+    # fragments the remaining free memory into sub-allocation-size blocks and OOMs even
+    # when total free GPU memory is sufficient. max_split_size_mb caps block splitting and
+    # garbage_collection_threshold reclaims cached blocks under pressure, defragmenting
+    # without the expandable_segments VMM path (which raises a driver-level OOM on this
+    # driver). Affects ONLY memory layout, never compute, so determinism is unchanged
+    # (numerics remain governed by CUBLAS_WORKSPACE_CONFIG + deterministic algorithms).
+    # Allocator config is REGIME-DEPENDENT (genesis smoke #2 root-cause, 2026-06-25):
+    # the deterministic MATH path materializes the O(seq²) score tensor and needs
+    # max_split_size_mb to defragment those large allocations (expandable_segments
+    # driver-OOMs on this driver, so it is not an option there). But under the production
+    # flash regime (SN125_DIAG_FLASH) the score tensor is never materialized, and the
+    # 512MB split cap instead FRAGMENTS the heap — a 320MiB alloc failed amid ~132GiB free
+    # in the genesis smoke. RUN #3 ran 102k steps clean (flash, in-process) on the PyTorch
+    # DEFAULT allocator, so for the flash regime match it: keep the reclaim threshold but
+    # drop the split cap that causes the fragmentation.
     if os.environ.get("SN125_DIAG_FLASH"):
+        # Flash regime: no split cap (it fragments — 320MiB failed amid 131GiB free on
+        # B200) and NOT expandable_segments (driver-OOMs on this driver, confirmed). Let
+        # PyTorch grow its pool freely into the B200's large free HBM, as RUN #3 did.
         safe_env["PYTORCH_CUDA_ALLOC_CONF"] = "garbage_collection_threshold:0.8"
     else:
         safe_env["PYTORCH_CUDA_ALLOC_CONF"] = "garbage_collection_threshold:0.8,max_split_size_mb:512"
+    # Pin to single GPU — prevents multi-GPU memory allocation outside cgroup accounting
     safe_env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
     safe_env["NVIDIA_VISIBLE_DEVICES"] = safe_env["CUDA_VISIBLE_DEVICES"]
+    # Tell sandbox setup script where the HF cache is (for bind-mount)
     safe_env["_SN125_HF_CACHE"] = settings.hf_home()
     return safe_env
 
@@ -1722,11 +2100,41 @@ def _kill_process_group(proc) -> None:
     except Exception:
         return
     if pgid == os.getpgid(0):
-        return
+        return  # never kill our own group
     try:
         os.killpg(pgid, signal.SIGKILL)
     except Exception:
         pass
+
+
+def _seccomp_weights_dir() -> str:
+    """Root-owned, world-readable directory for staged refiner weights when the
+    worker shares our mount namespace (seccomp flavour). Lives next to the
+    per-run directories, which the nobody worker already has to reach."""
+    base = os.environ.get("SN125_RUN_DIR_BASE") or tempfile.gettempdir()
+    d = os.path.join(base, "sn125_refiner_weights")
+    os.makedirs(d, mode=0o755, exist_ok=True)
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or (st.st_mode & 0o022):
+        raise RuntimeError(f"refusing refiner weight staging dir {d}: not a private directory of this user")
+    os.chmod(d, 0o755)
+    return d
+
+
+def _readable_by_worker(path: str) -> bool:
+    """True when a process with no ownership of ``path`` (the nobody worker) can
+    open it: every ancestor is world-searchable and the file world-readable."""
+    p = os.path.realpath(path)
+    if not os.stat(p).st_mode & 0o004:
+        return False
+    d = os.path.dirname(p)
+    while True:
+        if not os.stat(d).st_mode & 0o001:
+            return False
+        parent = os.path.dirname(d)
+        if parent == d:
+            return True
+        d = parent
 
 
 def _preflight_shard_manifest(task: "TaskSpec") -> str | None:
@@ -1753,10 +2161,11 @@ def evaluate_submission_isolated(
     source: str | dict, task: TaskSpec, seed: int, lr: float, wd: float,
     use_amp: bool = False, dataset_name: str | None = None,
     baseline_step_time: float | None = None,
-    timeout: float = 0,
+    timeout: float = 0,  # 0 = auto
     net_isolate: bool = True,
     compute_budget_seconds: float = 0.0,
     checkpoint_out: str = "",
+    refiner_cfg: dict | None = None,  # Refiner task (see evaluate_submission); weights are staged for the sandbox
 ) -> TrainingCurve:
     """Run miner code in a principled OS-level sandbox.
 
@@ -1788,6 +2197,7 @@ def evaluate_submission_isolated(
     if dataset_name is None:
         dataset_name = getattr(task, "dataset", "fineweb-edu")
 
+    # Normalize source to multi-file format
     if isinstance(source, str):
         files = {"optimizer.py": source}
     else:
@@ -1800,11 +2210,14 @@ def evaluate_submission_isolated(
     max_step = min(max_step, 30.0)
     max_total_time = max(600.0, task.total_steps * max_step * 2) if timeout <= 0 else timeout
     has_native = any(f.endswith((".cu", ".c")) for f in files)
+    # Extra time for compilation if native code present
     compile_overhead = 120 if has_native else 0
     load_overhead = max(30, min(180, max_total_time * 0.2))
     proc_timeout = max_total_time + load_overhead + compile_overhead
 
     use_sandbox = net_isolate and sandbox_available
+    # FAIL-CLOSED (C1/C6): when the sandbox is required, refuse to launch miner
+    # code outside it instead of silently degrading to a bare subprocess.
     if _sandbox_required() and not use_sandbox:
         why = ("net_isolate=False" if not net_isolate else
                ("seccomp sandbox unavailable on this box (needs root + x86_64 + "
@@ -1819,35 +2232,125 @@ def evaluate_submission_isolated(
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     use_seccomp = use_sandbox and sandbox_mode == "seccomp"
     run_dir = ""
+    # Pre-generate data in parent (has network access) and save to shared file.
+    # The subprocess (no network due to --net) loads from this file.
+    # This is architecturally correct: the validator controls exactly what data
+    # the miner optimizer sees. Same seed → same data for baseline and miner.
     data_dir = os.path.join(settings.hf_home(), "sn125_data")
     os.makedirs(data_dir, exist_ok=True)
+    # Hash must include ALL inputs to data generation: tokenizer (model_config) determines
+    # tokenization, eval_sequences determines eval batch count. Missing either causes
+    # cache collisions if tasks share other params but differ on these.
     _cfg_slug = task.model_config.replace("/", "_")
-    _manifest_slug = getattr(task, "data_manifest", "")[:12]
+    _manifest_slug = getattr(task, "data_manifest", "")[:12]  # pinned shards: rebuilt manifest => new cache entry
     data_hash = f"{task.task_id}_{seed}_{task.total_steps}_{task.batch_size}_{task.sequence_length}_{dataset_name}_{_cfg_slug}_{task.eval_sequences}_{_manifest_slug}"
     data_path = os.path.join(data_dir, f"{data_hash}.pt")
+    # In sandbox: data dir is under HF cache bind-mount → /tmp/hf_cache/sn125_data/
     sandbox_data_path = f"/tmp/hf_cache/sn125_data/{data_hash}.pt"
+    # §4.3 data contract: a manifest-pinned shard task ships NO .pt to the worker.
+    # The shards already live under the repo data dir, which the sandbox bind-mounts
+    # read-only at the same logical path; the worker (data_cache=None) builds the
+    # lazy ShardBatchSequence itself — O(batch) host RAM over the full N≈760k steps,
+    # where pickling the materialized list would be a ~25GB blob that can't be carried.
+    # Both baseline and miner build from the same seed + hash-pinned manifest, so the
+    # data is byte-identical (CRN) without the parent shipping anything. Preflight the
+    # manifest here to fail fast (no wasted sandbox provision) on a mismatch/absence.
     if dataset_name == "fineweb-edu-shards":
         _pf = _preflight_shard_manifest(task)
         if _pf is not None:
             return TrainingCurve(task.task_id, lr, wd, [], [], failed=True, error=_pf)
-        data_path = ""
+        data_path = ""  # worker loads lazily from on-disk shards; no .pt
     else:
+        pass
+    # Refiner task preflight (parent side, runs as root): the document index must
+    # exist next to the shards before the read-only sandbox worker opens the entry
+    # stream, and the miner's weights must sit on a path the nobody worker can read
+    # (the HF-cache bind mount, like the .pt data cache).
+    worker_refiner_cfg = None
+    if refiner_cfg is not None:
+        try:
+            from .refiner.entries import ensure_doc_index
+            worker_refiner_cfg = dict(refiner_cfg)
+            ensure_doc_index(refiner_cfg.get("data_dir") or None, refiner_cfg.get("split", "train"))
+            wp = refiner_cfg.get("weights_path") or ""
+            if wp:
+                import hashlib as _hl, shutil
+                from .refiner.refproc import REFINER_MAX_WEIGHT_BYTES, validate_refiner_weights
+                # Untrusted artifact: cap the size before copying a byte, copy
+                # under a private name, then validate and hash THE COPY — the
+                # bytes the worker will load — so nothing can swap the file
+                # between validation and use.
+                if os.path.getsize(wp) > REFINER_MAX_WEIGHT_BYTES:
+                    raise ValueError(f"refiner weights {os.path.getsize(wp)} bytes exceed cap "
+                                     f"{REFINER_MAX_WEIGHT_BYTES}")
+                # bwrap binds data_dir into the sandbox; the seccomp flavour has no
+                # mount namespace and data_dir may sit under a 0700 home the
+                # nobody worker cannot traverse, so stage where it can read.
+                stage_dir = _seccomp_weights_dir() if use_seccomp else data_dir
+                tmp = os.path.join(stage_dir, f"refiner_staging.{os.getpid()}.tmp")
+                shutil.copyfile(wp, tmp)
+                try:
+                    validate_refiner_weights(tmp)
+                    h = _hl.sha256()
+                    with open(tmp, "rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+                    staged_name = f"refiner_{h.hexdigest()[:32]}.safetensors"
+                    staged = os.path.join(stage_dir, staged_name)
+                    os.chmod(tmp, 0o644)
+                    os.replace(tmp, staged)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                # Staged copies are content-addressed and up to 450 MB each; drop the
+                # ones no live run can still need (older than two eval timeouts).
+                for _old in os.listdir(stage_dir):
+                    _op = os.path.join(stage_dir, _old)
+                    if (_old.startswith("refiner_") and _old.endswith(".safetensors") and _old != staged_name
+                            and time.time() - os.path.getmtime(_op) > 48 * 3600):
+                        try:
+                            os.unlink(_op)
+                        except OSError:
+                            pass
+                os.utime(staged)  # re-used by an identical submission: keep it fresh
+                if use_seccomp and not _readable_by_worker(staged):
+                    raise RuntimeError(f"staged refiner weights are not readable by uid 65534: {staged}")
+                worker_refiner_cfg["weights_path"] = (
+                    f"/tmp/hf_cache/sn125_data/{staged_name}"
+                    if (use_sandbox and not use_seccomp) else staged)
+                worker_refiner_cfg["weights_sha256"] = h.hexdigest()
+            # Refiner runs allocate data-dependent shapes every step (selected
+            # positions, per-bucket scoring batches). With the 512 MB split cap
+            # each new large size needs a fresh segment and the cached pool grew
+            # to the 80 GB ceiling on an A100 while live memory stayed ~5 GB.
+            # Drop the cap for this task only (the flash-regime setting the
+            # comment in _make_safe_env already argues for); the optimizer task's
+            # worker env stays byte-identical. Memory layout only, never numerics.
+            safe_env["PYTORCH_CUDA_ALLOC_CONF"] = "garbage_collection_threshold:0.8"
+        except Exception as e:
+            return TrainingCurve(task.task_id, lr, wd, [], [], failed=True,
+                                 error=f"refiner preflight failed: {type(e).__name__}: {e}")
+    if dataset_name != "fineweb-edu-shards":
         try:
             if not os.path.exists(data_path):
-                total_batches = min(task.total_steps + 10, 2000)
+                # Eager loaders (legacy streaming / synthetic) materialize a batch
+                # list, so they keep the 2000-cap; these runs are bounded/short.
+                total_batches = min(task.total_steps + 10, 2000)  # cap to avoid OOM on long runs
                 eval_batches = max(1, task.eval_sequences // task.batch_size)
                 train_data = _load_real_data(dataset_name, task.sequence_length, task.batch_size,
                                              total_batches, seed, tokenizer_name=task.model_config)
                 eval_data = _load_real_data(dataset_name, task.sequence_length, task.batch_size,
                                             eval_batches, seed + 1_000_000, split="train",
                                             tokenizer_name=task.model_config)
+                # Atomic write: tempfile + rename prevents TOCTOU race if two validators
+                # try to create the same data file concurrently
                 fd, tmp_path = tempfile.mkstemp(dir=data_dir, suffix=".pt.tmp")
                 os.close(fd)
                 try:
                     torch.save({"train": [t.cpu() for t in train_data],
                                  "eval": [t.cpu() for t in eval_data]}, tmp_path)
-                    os.replace(tmp_path, data_path)
-                    os.chmod(data_path, 0o644)
+                    os.replace(tmp_path, data_path)  # atomic on same filesystem
+                    os.chmod(data_path, 0o644)  # sandbox runs as nobody — needs read access
                 except BaseException:
                     try: os.unlink(tmp_path)
                     except OSError: pass
@@ -1858,10 +2361,18 @@ def evaluate_submission_isolated(
                                  error=f"Data pre-generation failed: {e}")
 
     if use_seccomp:
+        # Private per-run directory for the nobody worker (build products,
+        # compiler caches, TMPDIR). Created fresh with mkdtemp (0700) and
+        # chowned to the worker uid, so nothing pre-planted can live there.
         run_dir = tempfile.mkdtemp(prefix="sn125_run_", dir=os.environ.get("SN125_RUN_DIR_BASE") or None)
         os.chown(run_dir, 65534, 65534)
         safe_env["_SN125_RUN_DIR"] = run_dir
     if use_sandbox and checkpoint_out:
+        # The worker (uid 65534) writes the final + quartile checkpoints next to
+        # checkpoint_out; make that directory writable for it. Under the
+        # namespace flavour the mount view is private but the path is the real
+        # filesystem, so the same ownership fix applies. Files are read back by
+        # root, which needs no permission.
         try:
             ck_dir = os.path.dirname(os.path.abspath(checkpoint_out)) or "."
             os.makedirs(ck_dir, exist_ok=True)
@@ -1872,6 +2383,9 @@ def evaluate_submission_isolated(
             return TrainingCurve(task.task_id, lr, wd, [], [], failed=True,
                                  error=f"checkpoint dir not writable for the sandbox worker: {e}")
 
+    # Single subprocess handles everything: mount ns → compile → priv drop → train
+    # `-P` (3.11+) keeps the cwd/script dir off sys.path: the worker imports
+    # only from PYTHONPATH (the root-owned project) and site-packages.
     py_flags = ["-P"] if sys.version_info >= (3, 11) else []
     if use_seccomp:
         worker_full = _SECCOMP_SANDBOX_SETUP_SCRIPT + _WORKER_SCRIPT
@@ -1884,6 +2398,9 @@ def evaluate_submission_isolated(
     else:
         cmd = [sys.executable, "-c", _WORKER_SCRIPT]
 
+    # Nonce: random token included in worker's JSON output. Parent only accepts JSON
+    # lines with matching nonce. Prevents native code (C/CUDA pthread) from injecting
+    # fake results via stdout after the worker's real output.
     import secrets
     _nonce = secrets.token_hex(16)
     args_json = json.dumps({
@@ -1894,10 +2411,22 @@ def evaluate_submission_isolated(
         "baseline_step_time": baseline_step_time, "max_total_time": max_total_time,
         "compute_budget_seconds": compute_budget_seconds, "_nonce": _nonce,
         "checkpoint_out": checkpoint_out,
+        # Checkpointing writes model-sized safetensors files. Keep the low 100MB file-size
+        # limit for normal miner evaluations, but raise it for validator-requested exports.
         "file_size_limit": int(4 * 1024**3) if checkpoint_out else int(100 * 1024**2),
+        # CPU-second cap for the sandbox RLIMIT_CPU, scaled to the wall-clock budget so
+        # legitimate budget-length runs (incl. the 20h confirmation) aren't SIGXCPU-killed.
+        # 2x + 600s headroom: CPU ~= wall for a CUDA-sync-bound job, factor covers CPU-heavy
+        # phases (tokenization, data prep). Parent proc_timeout is still the primary limiter.
         "cpu_seconds_limit": int(proc_timeout * 2 + 600),
+        # Empty when shards are loaded lazily in-worker (§4.3); else the cached .pt.
+        # Namespaces see the HF cache at the bind-mounted /tmp/hf_cache path;
+        # the seccomp flavour has no private mount view and reads the real path.
         "data_path": "" if not data_path else (
             sandbox_data_path if (use_sandbox and not use_seccomp) else data_path),
+        # Refiner task config (None on the optimizer task); weights_path already
+        # rewritten to the sandbox-visible staged copy above.
+        "refiner": worker_refiner_cfg,
     })
 
     worker_log_path = os.environ.get("SN125_WORKER_LOG_PATH", "").strip()
@@ -1951,6 +2480,7 @@ def evaluate_submission_isolated(
         if forward_worker_progress and _interesting_worker_line(text):
             print(f"[worker:{stream}] {text.rstrip()}", flush=True)
 
+    # cgroup v2: hard physical memory + pids limits (kernel-enforced, not bypassable)
     _cgroup_counter = getattr(evaluate_submission_isolated, "_ctr", 0) + 1
     evaluate_submission_isolated._ctr = _cgroup_counter
     cgroup_name = f"sn125_worker_{os.getpid()}_{_cgroup_counter}"
@@ -1958,23 +2488,32 @@ def evaluate_submission_isolated(
 
     proc = None
     try:
+        # Own session/process group: the container flavour has no PID
+        # namespace, so a killpg on timeout/exit is what stops the CUDA-IPC
+        # optimizer child and anything the miner forked or setsid'd.
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=project_root, env=safe_env, start_new_session=True,
         )
+        # Add subprocess to cgroup BEFORE it does any real work (it blocks on stdin)
         if cgroup_path:
             _cgroup_add_pid(cgroup_path, proc.pid)
 
-        _MAX_STDOUT = 10 * 1024 * 1024
+        # Write stdin, then read stdout with size cap to prevent native-code DoS
+        # (malicious .c/.cu could flood stdout with printf before timeout)
+        _MAX_STDOUT = 10 * 1024 * 1024  # 10 MB cap
         proc.stdin.write(args_json.encode())
         proc.stdin.close()
         import select
         from collections import deque
         _stdout_chunks = []
         _stdout_len = 0
+        # Ring buffer of last 4 chunks (~256KB) as tail.  Single-chunk tail
+        # could lose the nonce line if native code floods stdout AFTER the
+        # worker's authenticated output (the flood overwrites the one chunk).
         _stdout_tail = deque(maxlen=4)
         _stderr_chunks = []
-        _open_fds = {proc.stdout, proc.stderr}
+        _open_fds = {proc.stdout, proc.stderr}  # track live fds to avoid busy-spin on EOF
         _deadline = time.time() + proc_timeout
         _stdout_line_buf = b""
         _stderr_line_buf = b""
@@ -2008,6 +2547,7 @@ def evaluate_submission_isolated(
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(cmd, proc_timeout)
             if not _open_fds:
+                # Both pipes at EOF — wait for process exit instead of spinning
                 proc.wait(timeout=max(remaining, 0.1))
                 _flush_worker_lines()
                 break
@@ -2015,7 +2555,7 @@ def evaluate_submission_isolated(
             for fd in ready:
                 chunk = fd.read1(65536) if hasattr(fd, 'read1') else fd.read(65536)
                 if not chunk:
-                    _open_fds.discard(fd)
+                    _open_fds.discard(fd)  # EOF — stop selecting this fd
                     continue
                 if fd is proc.stdout:
                     _stdout_len += len(chunk)
@@ -2024,9 +2564,10 @@ def evaluate_submission_isolated(
                     else:
                         _stdout_tail.append(chunk)
                 else:
-                    _stderr_chunks.append(chunk[-2048:])
+                    _stderr_chunks.append(chunk[-2048:])  # keep only tail of stderr
                 _consume_worker_lines(fd, chunk)
             if proc.poll() is not None:
+                # Process exited — drain remaining output
                 for fd, store, limit in [(proc.stdout, _stdout_chunks, _MAX_STDOUT),
                                           (proc.stderr, _stderr_chunks, 4096)]:
                     while True:
@@ -2045,6 +2586,8 @@ def evaluate_submission_isolated(
         if _stdout_tail:
             stdout += b"\n" + b"".join(_stdout_tail)
         stderr = b"".join(_stderr_chunks)
+        # Parse result: only accept JSON lines with matching nonce.
+        # This prevents native code (C pthread) from injecting fake results via stdout.
         result = None
         for line in reversed(stdout.decode(errors="replace").strip().split("\n")):
             line = line.strip()
@@ -2055,6 +2598,8 @@ def evaluate_submission_isolated(
             except json.JSONDecodeError:
                 continue
             if parsed.get("_nonce") == _nonce:
+                # Validate result structure — malicious native code could inject
+                # valid JSON with correct nonce but wrong types
                 if not (isinstance(parsed.get("eval_points"), list) and
                         isinstance(parsed.get("train_points"), list)):
                     continue
@@ -2065,8 +2610,9 @@ def evaluate_submission_isolated(
             result = {"task_id": task.task_id, "lr": lr, "wd": wd,
                       "eval_points": [], "train_points": [], "wall_seconds": 0.0,
                       "failed": True, "error": f"No authenticated output. stderr: {stderr.decode(errors='replace')[-500:]}"}
+        # Reap subprocess and close file descriptors (prevent zombies + fd leak)
         proc.wait()
-        _kill_process_group(proc)
+        _kill_process_group(proc)  # stray optproc / miner-forked children
         for fd in (proc.stdout, proc.stderr):
             try: fd.close()
             except Exception: pass
@@ -2130,6 +2676,7 @@ def evaluate_submission_isolated(
         step_times=result.get("step_times", []),
         iter_times=result.get("iter_times", []),
         checkpoints=result.get("checkpoints", []),
+        refiner_stats=result.get("refiner_stats", {}) or {},
     )
 
 
@@ -2148,3 +2695,4 @@ def cleanup_data_cache(max_age_s: float = 3600):
                 pass
 
 
+# Quick Self-Test

@@ -27,8 +27,11 @@ profitability: unknown_without_evidence
 ```
 
 These are the packaged defaults, not a substitute for the live round contract.
-The included validator identity is a placeholder and the launch timestamp is
-unset. A launch announcement or reachable website is not proof that mining is ready.
+The included validator identity is the production validator (uid 203 on netuid
+125); check it against the signed round announcement. `LAUNCH_TIMESTAMP` is 0 by
+design (the payout ramp anchors on the first confirmed event). A launch
+announcement or reachable website is not proof that mining is ready; the
+published round records are.
 
 ## Authority and input precedence
 

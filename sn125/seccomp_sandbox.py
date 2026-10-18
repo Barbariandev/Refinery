@@ -55,6 +55,7 @@ import platform
 import socket
 import struct
 
+# ── seccomp / BPF constants (linux/seccomp.h, linux/filter.h, linux/audit.h) ──
 SECCOMP_MODE_FILTER = 2
 SECCOMP_SET_MODE_FILTER = 1
 SECCOMP_FILTER_FLAG_TSYNC = 1
@@ -65,16 +66,18 @@ AUDIT_ARCH_X86_64 = 0xC000003E
 X32_SYSCALL_BIT = 0x40000000
 PR_SET_NO_NEW_PRIVS = 38
 PR_SET_SECCOMP = 22
-NR_SECCOMP = 317
+NR_SECCOMP = 317  # x86_64
 
 BPF_LD, BPF_W, BPF_ABS = 0x00, 0x00, 0x20
 BPF_JMP, BPF_JEQ, BPF_JGE, BPF_K = 0x05, 0x10, 0x30, 0x00
 BPF_RET = 0x06
 
+# struct seccomp_data offsets (all little-endian on x86_64).
 _OFF_NR = 0
 _OFF_ARCH = 4
 _OFF_ARG0_LO = 16
 
+# ── x86_64 syscall numbers (asm/unistd_64.h) ────────────────────────────────
 NR = {
     "socket": 41, "socketpair": 53, "ptrace": 101,
     "pivot_root": 155, "chroot": 161, "acct": 163, "settimeofday": 164,
@@ -90,6 +93,10 @@ NR = {
     "move_mount": 429,
 }
 
+# Everything here is refused with EPERM. Network *creation* is handled by the
+# socket() domain check below (AF_UNIX allowed, every other family denied),
+# io_uring is denied because IORING_OP_SOCKET would bypass that check, and
+# the rest are process-boundary / kernel-state syscalls a miner never needs.
 DENIED = (
     "ptrace", "process_vm_readv", "process_vm_writev", "pidfd_getfd", "kcmp",
     "io_uring_setup", "io_uring_enter", "io_uring_register",
@@ -105,6 +112,7 @@ DENIED = (
 
 AF_UNIX = 1
 
+# Attestation fields the worker embeds in its nonce-authenticated output.
 SANDBOX_MODE_NAMESPACES = "namespaces"
 SANDBOX_MODE_SECCOMP = "seccomp"
 
@@ -130,21 +138,31 @@ def build_filter(denied: tuple[str, ...] = DENIED,
         ALLOW
     """
     nrs = sorted({NR[name] for name in denied})
+    # Tail block, in order: ALLOW, EPERM, KILL, then the socket sub-check.
     ret_allow = _stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
     ret_eperm = _stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | errno.EPERM)
     ret_kill = _stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS)
 
+    # Socket sub-check: ld arg0 (domain); for each allowed domain jeq -> ALLOW;
+    # fallthrough -> EPERM. Placed AFTER the three returns, so its own returns
+    # are explicit instructions (simpler than computing backward offsets).
     sock_block = [_stmt(BPF_LD | BPF_W | BPF_ABS, _OFF_ARG0_LO)]
     n_dom = len(allowed_socket_domains)
     for i, dom in enumerate(allowed_socket_domains):
+        # jt: jump over remaining domain checks + the EPERM to reach ALLOW.
         remaining = n_dom - i - 1
         sock_block.append(_jump(BPF_JMP | BPF_JEQ | BPF_K, dom, remaining + 1, 0))
     sock_block.append(_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | errno.EPERM))
     sock_block.append(_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW))
 
-    n_dispatch = 1 + len(nrs)
+    # Head: arch + x32 checks, then the dispatch table.
+    # Index bookkeeping: after the dispatch table come [ALLOW, EPERM, KILL, sock...].
+    n_dispatch = 1 + len(nrs)  # socket jeq + one jeq per denied nr
     head: list[bytes] = []
+    # 0: ld arch
     head.append(_stmt(BPF_LD | BPF_W | BPF_ABS, _OFF_ARCH))
+    # 1: jeq X86_64 ? next : KILL   (KILL sits at: 4 + n_dispatch - 1 - 1 ... compute below)
+    # We compute absolute indices then convert to relative offsets.
     idx_ld_nr = 2
     idx_x32 = 3
     idx_dispatch0 = 4
@@ -153,8 +171,11 @@ def build_filter(denied: tuple[str, ...] = DENIED,
     idx_kill = idx_allow + 2
     idx_sock = idx_allow + 3
     head.append(_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, idx_kill - 2))
+    # 2: ld nr
     head.append(_stmt(BPF_LD | BPF_W | BPF_ABS, _OFF_NR))
+    # 3: jge X32_BIT -> KILL
     head.append(_jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, idx_kill - idx_x32 - 1, 0))
+    # 4: jeq socket -> sock block
     head.append(_jump(BPF_JMP | BPF_JEQ | BPF_K, NR["socket"], idx_sock - idx_dispatch0 - 1, 0))
     for j, nr in enumerate(nrs):
         idx = idx_dispatch0 + 1 + j
@@ -211,6 +232,7 @@ def install_filter(prog: bytes | None = None, *, tsync: bool = True) -> dict:
     rc = libc.syscall(NR_SECCOMP, SECCOMP_SET_MODE_FILTER, flags, ctypes.byref(fprog))
     if rc != 0:
         e = ctypes.get_errno()
+        # Fallback for kernels without the seccomp(2) syscall: prctl path, no tsync.
         rc2 = libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(fprog), 0, 0)
         if rc2 != 0:
             e2 = ctypes.get_errno()
@@ -231,7 +253,7 @@ def probe_network_denied() -> dict:
         try:
             s = socket.socket(fam, socket.SOCK_STREAM)
             s.close()
-            obs[name] = "open"
+            obs[name] = "open"  # NOT denied
         except PermissionError:
             obs[name] = "eperm"
         except OSError as e:
@@ -289,6 +311,7 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001
         print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
         return 1
+    # Fork/exec must still work (compilers, the optimizer process).
     import subprocess
     child = subprocess.run([sys.executable, "-c",
                             "import socket\n"

@@ -115,7 +115,7 @@ LICENSE GRANT (submission terms):
   (Apache-2.0 or MIT), WITH ATTRIBUTION TO YOUR SUBMITTING HOTKEY. You keep
   full ownership and may license your work to anyone else however you like.
   This is what makes the Refinery publication pipeline possible: frontier
-  optimizers are published (paper + repo) credited to their hotkeys, and you
+  optimizers are published (code and results) credited to their hotkeys, and you
   can claim that credit under any identity — or stay pseudonymous — by
   signing an authorship proof with your hotkey:
 
@@ -158,6 +158,8 @@ class Optimizer:
         self.beta1, self.beta2, self.eps = 0.9, 0.999, 1e-8
 
     def _schedule(self, step):
+        # Reference WSD shape: linear warmup -> stable -> cosine decay tail.
+        # The schedule is yours to change — the harness applies none.
         if self.warmup_steps > 0 and step < self.warmup_steps:
             return (step + 1) / self.warmup_steps
         if self.decay_fraction > 0.0 and self.total_steps > 0:
@@ -181,7 +183,10 @@ class Optimizer:
                 s["v"].mul_(self.beta2).addcmul_(g, g, value=1 - self.beta2)
                 m_hat = s["m"] / (1 - self.beta1 ** t)
                 v_hat = s["v"] / (1 - self.beta2 ** t)
+                # YOUR UPDATE RULE HERE
+                # This is standard AdamW. Replace it with something better.
                 update = -lr * (m_hat / (v_hat.sqrt() + self.eps))
+                # END UPDATE RULE
                 if wd > 0:
                     update.add_(param_values[name], alpha=-lr * wd)
                 updates[name] = update

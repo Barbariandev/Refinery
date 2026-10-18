@@ -51,7 +51,7 @@ import weakref
 import torch
 import torch.multiprocessing as tmp
 
-ParamSpec = list[dict]
+ParamSpec = list[dict]  # [{"params": [(name, shape, dtype)], "lr":..., "weight_decay":...}]
 
 
 class OptProcError(RuntimeError):
@@ -62,6 +62,7 @@ class OptProcTimeout(OptProcError):
     """Miner process failed to respond within the deadline (process killed)."""
 
 
+# ── recursive tensor movers (state/RNG cross the pipe as CPU objects) ────────
 
 def _to_cpu(obj):
     if torch.is_tensor(obj):
@@ -76,6 +77,7 @@ def _to_cpu(obj):
 
 def _to_device(obj, device):
     if torch.is_tensor(obj) and obj.dtype not in (torch.uint8,):
+        # RNG states are uint8 CPU tensors and must STAY on CPU.
         return obj.to(device)
     if isinstance(obj, dict):
         return {k: _to_device(v, device) for k, v in obj.items()}
@@ -85,6 +87,7 @@ def _to_device(obj, device):
     return obj
 
 
+# ── miner-process entry point (the ONLY code that touches miner source) ─────
 
 def _optproc_main(conn, source: str, param_groups_spec: ParamSpec, config: dict,
                   grad_bufs: dict, param_bufs: dict, device: str, sandboxed: bool):
@@ -94,6 +97,7 @@ def _optproc_main(conn, source: str, param_groups_spec: ParamSpec, config: dict,
         if device.startswith("cuda"):
             dev = torch.device(device)
             torch.cuda.set_device(dev.index if dev.index is not None else 0)
+            # Match the harness's determinism settings (replay/§6.3 depends on it).
             torch.use_deterministic_algorithms(True, warn_only=False)
             torch.backends.cudnn.benchmark = False
         if sandboxed:
@@ -127,7 +131,7 @@ def _optproc_main(conn, source: str, param_groups_spec: ParamSpec, config: dict,
         try:
             msg = conn.recv()
         except EOFError:
-            return
+            return  # parent gone
         op = msg[0]
         try:
             if op == "step":
@@ -135,6 +139,9 @@ def _optproc_main(conn, source: str, param_groups_spec: ParamSpec, config: dict,
                 param_values_available = True if len(msg) < 3 else bool(msg[2])
                 names = []
                 if ordered_step is not None:
+                    # Optional lean contract: ordered tensor lists avoid per-step
+                    # dict construction and miner-side name lookups. Returning None
+                    # means the optimizer wrote updates in-place to grad_list.
                     pvals = param_list if param_values_available else []
                     updates = ordered_step(grad_list, pvals, step_idx)
                     if updates is None:
@@ -173,6 +180,7 @@ def _optproc_main(conn, source: str, param_groups_spec: ParamSpec, config: dict,
                                 buf.copy_(u)
                             names.append(name)
                 else:
+                    # Legacy contract: dicts keyed by parameter name.
                     pvals = dict(param_bufs) if param_values_available else {}
                     updates = opt.step(dict(grad_bufs), pvals, step_idx)
                     for name, u in (updates or {}).items():
@@ -196,7 +204,7 @@ def _optproc_main(conn, source: str, param_groups_spec: ParamSpec, config: dict,
                             f"returns_full_update=True but update set differs; missing={missing}, extra={extra}")
                 if device.startswith("cuda"):
                     if not bool(config.get("_unsynced_ipc", False)):
-                        torch.cuda.synchronize()
+                        torch.cuda.synchronize()  # writes visible before we signal done
                 conn.send(("ok", step_idx, None if returns_full_update else names))
             elif op == "get_state":
                 conn.send(("state", _to_cpu(opt.state_dict())))
@@ -220,6 +228,7 @@ def _optproc_main(conn, source: str, param_groups_spec: ParamSpec, config: dict,
             else:
                 conn.send(("error", f"unknown op {op!r}"))
         except BaseException:
+            # Report and keep serving — the harness decides whether it's fatal.
             conn.send(("error", traceback.format_exc()))
 
 
@@ -232,6 +241,7 @@ def _kill_proc(proc):
             proc.join(timeout=5.0)
 
 
+# ── harness-side handle ──────────────────────────────────────────────────────
 
 class OptProcHandle:
     """Harness-side controller for one isolated miner optimizer process.
@@ -310,6 +320,7 @@ class OptProcHandle:
             raise OptProcError(f"miner process failed to start: {msg!r}")
         self.pid = msg[1]
 
+    # ── protocol plumbing ──
     def _recv(self, timeout: float):
         if not self._conn.poll(timeout):
             _kill_proc(self._proc)
@@ -372,6 +383,7 @@ class OptProcHandle:
         self._target_by_name = by_name
         return targets, by_name
 
+    # ── miner-contract surface ──
     def step(self, gradients: dict, param_values: dict, step_number: int) -> dict:
         """Fill shared buffers, run one isolated step, return the updates.
 
@@ -390,7 +402,7 @@ class OptProcHandle:
                 buf.copy_(p) if p is not None else buf.zero_()
         if self.device.type == "cuda":
             if not self._unsynced_ipc:
-                torch.cuda.synchronize()
+                torch.cuda.synchronize()  # copies visible to the miner context before signaling
         msg = self._request(("step", step_number, param_values_available),
                             self.step_timeout)
         names = self._param_names if msg[2] is None else msg[2]
@@ -423,7 +435,7 @@ class OptProcHandle:
             model.zero_grad(set_to_none=True)
         if self.device.type == "cuda":
             if not self._unsynced_ipc:
-                torch.cuda.synchronize()
+                torch.cuda.synchronize()  # copies visible to the miner context before signaling
 
         msg = self._request(("step", step_number, param_values_available),
                             self.step_timeout)
@@ -517,6 +529,8 @@ def make_split_optimizer_cls(source: str, device: str, *, sandboxed: bool = True
         def load_state_dict(self, s):
             self._handle.load_state_dict(s)
 
+        # §6.3 segment checkpoints capture the miner PROCESS's RNG too — a
+        # miner drawing randomness draws it in its own address space.
         def get_rng_state(self):
             return self._handle.get_rng_state()
 

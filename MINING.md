@@ -46,11 +46,13 @@ Confirm the signed round announcement and live fee before transferring funds.
 Do not infer addresses from examples or pay an address supplied by an unverified
 message. Registration costs and evaluation fees are separate.
 
-In this source snapshot, `AUTHORIZED_VALIDATOR_HOTKEY` in
-[`sn125/config.py`](sn125/config.py) is still a placeholder and `LAUNCH_TIMESTAMP`
-is unset. The placeholder rejects commit/reveal requests. Obtain the correctly
-pinned production release or update the pin only from verified release details;
-do not remove the verification logic.
+`AUTHORIZED_VALIDATOR_HOTKEY` in [`sn125/config.py`](sn125/config.py) is the
+production validator (uid 203 on netuid 125); the miner rejects commit/reveal
+requests from any other hotkey. Check the pin against the signed round
+announcement, update it only from verified release details, and do not remove
+the verification logic. `LAUNCH_TIMESTAMP` is 0 by design (the payout ramp
+anchors on the first confirmed event); the round schedule is
+`ROUND_GRID_ANCHOR_TIMESTAMP` (00:00 UTC grid from 2026-10-19).
 
 Create your own wallet. The miner needs its operational hotkey and public wallet
 metadata, not the validator's cloud or R2 keys. Keep the coldkey signing material
@@ -150,10 +152,14 @@ python -m sn125 stage-shards \
   --expected-manifest "$SN125_FINEWEB_MANIFEST_HASH"
 ```
 
-Private shard access may need your own approved Hugging Face read token. Keep
-held-out data out of miner-controlled training environments; follow the clean
-scoring layout required by your worker. Never disable hash or isolation checks
-to make an experiment pass.
+Private shard access may need your own approved Hugging Face read token. The
+mirror is private for hosting, not secrecy: every shard, held-out included, is
+recomputable from the public `HuggingFaceFW/fineweb-edu` `sample-100BT` split
+with the fixed constants in `sn125/fineweb.py`, and `build_fineweb_shards()`
+reproduces the pinned manifest byte for byte. Keep held-out data out of
+miner-controlled training environments; follow the clean scoring layout
+required by your worker. Never disable hash or isolation checks to make an
+experiment pass.
 
 After approving compute spend, use a short smoke run on a disposable CUDA worker:
 
@@ -236,14 +242,39 @@ Do not change source or restart onto different bytes between commit and reveal.
 There is no manual submission REST endpoint: the validator requests the hash and
 source from your running miner.
 
+**Refiner task (Challenge 2).** Validators also accept refiner submissions
+(on by default; the task pays half of miner emission from its own frontier —
+bar +0.02 suite points, confirmation run; see
+[`docs/REFINER_TASK.md`](docs/REFINER_TASK.md) §9). One hotkey serves one
+submission, so it is either an optimizer or a refiner:
+
+```bash
+python -m sn125 mine --wallet-name W --wallet-hotkey H \
+    --refiner refiner.py --weights refiner.safetensors \
+    --weights-url https://your-host/refiner.safetensors
+```
+
+What you commit to is an envelope holding your source and the hash and size of
+the weight file. The scoring box downloads the file from your URL after the
+reveal and rejects it unless both match, so keep it reachable over https and
+unchanged for the whole round. The fee is the same as for an optimizer and is
+burned if the file is missing or different.
+
 ## 7. Track credits, rounds and confirmation
 
 Default cadence is a three-hour commit window, one-hour reveal window and roughly
-20-hour evaluation. Operator settings, capacity and previous-round completion
-determine actual deadlines. Do not schedule solely from these defaults.
+20-hour evaluation. Since 2026-10-19 rounds open on a 24-hour grid at **00:00 UTC**
+whenever the previous round has finished (the commit window is then 00:00–03:00
+UTC); a round that overran opens the next one immediately, and the grid is picked
+up again by the next round that finishes early. Operator settings, capacity and
+previous-round completion determine actual deadlines. Do not schedule solely
+from these defaults; read the round announcement.
 
-- Each finalized transfer grants `floor(transfer_rao / fee_rao)` credits under
-  the processed fee pin. Two half-fee transfers do not combine into one credit.
+- Each finalized transfer grants `floor((carry_rao + transfer_rao) / fee_rao)`
+  credits under the fee pin in force when it is processed. The remainder below
+  one fee is carried forward per coldkey (in rao) and shown on the grant entry,
+  so installments and over-payments count toward the next credit; nothing is
+  kept silently. TAO is never refunded, so send fee multiples where possible.
 - The paying coldkey owns the credits; hotkeys with that owner share them. Avoid
   unrelated sender accounts or exchange withdrawals that credit another identity.
 - One credit is debited when a commitment is accepted. Missing the reveal still
@@ -253,6 +284,34 @@ determine actual deadlines. Do not schedule solely from these defaults.
   can reduce the available capacity from the configured maximum of eight.
 - Miner-caused failures do not earn rewards. Infrastructure disqualification
   refunds an evaluation credit, not a TAO transfer.
+- If the validator abandons a round before publishing it (urgent software
+  update, crash, restart), every credit debited in that round is returned when
+  it starts again, except for commits already burned by miner fault (gate
+  failure, missed reveal, evaluation disqualification). Your commitment is
+  collected again in the next round; you do not need to pay or resubmit.
+- A round with no GPU is not a verdict on your code. After selection the round
+  keeps a **launch window** open (default 4 hours) during which every selected
+  commitment starts as soon as a B200 is available; inventory is polled per
+  submission, so a GPU that appears at hour three is used. A commitment that
+  never obtained a box inside the window is **carried** to the next round with
+  its credit and FIFO priority (same as a capacity-overflow deferral), and when
+  nothing at all could launch the next round opens immediately instead of
+  waiting out the 24 h period, so the search for capacity continues. The carry
+  is continuous: a commitment stays in the queue with its credit round after
+  round. Only a commitment carried 30 rounds and still unevaluated 30 days
+  after acceptance expires, and its credit is absorbed. A credit is only ever
+  burned as miner fault by something your submission did. (Round
+  `round_000000_1788861194` on 2026-09-08 recorded two "no capacity" failures
+  as miner-fault DQs; those credits were returned by the validator at its next
+  start, with a ledger entry naming each hotkey.)
+- Where a credit can be, in one line: paid → **granted**; commitment accepted →
+  **held** by that commitment (the `debit` entry names it); evaluated → consumed
+  (scored, or burned on miner fault); box ran and failed on our side → **refunded**;
+  no GPU → carried with the commitment (30 rounds / 30 days, then absorbed);
+  round abandoned → refunded. The
+  dashboard's key page shows the state of every commitment, and the validator's
+  start-up reconciliation (`audit/payments_reconciliation.jsonl` in the mirror)
+  lists any correction it made.
 - A candidate must improve validation loss by **more than** the adaptive bar.
   Its floor is 0.03 nats, but the actual threshold can be larger.
 - Confirmation uses the same source, is validator-funded, and must also qualify.

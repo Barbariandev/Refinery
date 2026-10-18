@@ -1,0 +1,383 @@
+{
+ "baseline": {
+  "bench": {
+   "checkpoint_sha256": "6c5857e0f5fa8b50e236145f78fc5f5fa224beab08fae48fbdfaa6ab7aadd6e9",
+   "mean_acc_norm": 0.5741999999999999,
+   "model_spec": "hf:lean-llama-360m",
+   "score": 0.5554233299571696,
+   "seconds": 38.500896692276,
+   "seq_len": 2048,
+   "suite_id": "easy_v0",
+   "suite_sha256": "ad25712aa737339d935eeba65d6200a7314424adc304f356c43eff7053d27a44",
+   "tasks": {
+    "arc_easy": {
+     "acc": 0.63,
+     "acc_norm": 0.587,
+     "bpb_gold": 1.147324662447778,
+     "kind": "mc",
+     "n": 1000,
+     "prob_correct": 0.5807149079947799,
+     "prob_correct_norm": 0.5489392130049418,
+     "seconds": 8.718680620193481
+    },
+    "hellaswag": {
+     "acc": 0.343,
+     "acc_norm": 0.444,
+     "bpb_gold": 0.8747822757323669,
+     "kind": "mc",
+     "n": 1000,
+     "prob_correct": 0.34171766145894744,
+     "prob_correct_norm": 0.44131529076955445,
+     "seconds": 9.499121189117432
+    },
+    "lambada": {
+     "acc": 0.379,
+     "bpb_gold": 0.7364631835455059,
+     "kind": "completion",
+     "n": 1000,
+     "n_target_tokens": 1376,
+     "ppl": 10.570593049631967,
+     "seconds": 2.1699838638305664
+    },
+    "openbookqa": {
+     "acc": 0.262,
+     "acc_norm": 0.336,
+     "bpb_gold": 1.669200994781328,
+     "kind": "mc",
+     "n": 500,
+     "prob_correct": 0.2433769629396112,
+     "prob_correct_norm": 0.33998949826028674,
+     "seconds": 4.453378200531006
+    },
+    "piqa": {
+     "acc": 0.677,
+     "acc_norm": 0.688,
+     "bpb_gold": 1.1769689122197171,
+     "kind": "mc",
+     "n": 1000,
+     "prob_correct": 0.659746453024285,
+     "prob_correct_norm": 0.6702677922781717,
+     "seconds": 4.481928825378418
+    },
+    "sciq": {
+     "acc": 0.873,
+     "acc_norm": 0.816,
+     "bpb_gold": 1.103666306238583,
+     "kind": "mc",
+     "n": 1000,
+     "prob_correct": 0.8220097313010891,
+     "prob_correct_norm": 0.7766048554728933,
+     "seconds": 9.177232027053833
+    }
+   },
+   "text_sha256": "",
+   "tokenizer": "HuggingFaceTB/SmolLM2-135M"
+  },
+  "curve": {
+   "checkpoints": [
+    {
+     "eval_loss": 2.969183356501162,
+     "pct": 0.25,
+     "sha256": "9df820fde9b07897ad96dae6720cbeb319eeabd8d08599d6e6bb85de57d09320",
+     "step": 47000,
+     "wall_t": 15219.673456430435
+    },
+    {
+     "eval_loss": 2.912450108677149,
+     "pct": 0.5,
+     "sha256": "6c319703b8287b00c6c9bb7a7558675b125444133ef0ca9769d9cbd59679903a",
+     "step": 94000,
+     "wall_t": 30355.693383216858
+    },
+    {
+     "eval_loss": 2.7691801181063056,
+     "pct": 0.75,
+     "sha256": "913eb68d48c79a876d0fa41e46291ea7478841ea58d0f5439d70bf914262e7f5",
+     "step": 141000,
+     "wall_t": 45445.4901163578
+    },
+    {
+     "eval_loss": 2.5919971764087677,
+     "pct": 1.0,
+     "sha256": "6c5857e0f5fa8b50e236145f78fc5f5fa224beab08fae48fbdfaa6ab7aadd6e9",
+     "step": 188000,
+     "wall_t": 60539.71603703499
+    }
+   ],
+   "error": "",
+   "eval_points": [
+    [
+     0,
+     10.995839059352875,
+     42.9545636177063
+    ],
+    [
+     9400,
+     3.275530155748129,
+     3120.16446018219
+    ],
+    [
+     18800,
+     3.115807645022869,
+     6140.994345664978
+    ],
+    [
+     28200,
+     3.032381471246481,
+     9153.142734766006
+    ],
+    [
+     37600,
+     2.9961968921124935,
+     12174.53989481926
+    ],
+    [
+     47000,
+     2.969183356501162,
+     15197.008329153061
+    ],
+    [
+     56400,
+     2.9539911318570375,
+     18239.672038316727
+    ],
+    [
+     65800,
+     2.9396461863070726,
+     21267.218599319458
+    ],
+    [
+     75200,
+     2.9304598858579993,
+     24296.033233642578
+    ],
+    [
+     84600,
+     2.921163913793862,
+     27319.583829402924
+    ],
+    [
+     94000,
+     2.912450108677149,
+     30333.1420648098
+    ],
+    [
+     103400,
+     2.9077905248850584,
+     33368.42143154144
+    ],
+    [
+     112800,
+     2.901822229847312,
+     36382.65303206444
+    ],
+    [
+     122200,
+     2.8679626444354653,
+     39398.93302774429
+    ],
+    [
+     131600,
+     2.808732572942972,
+     42409.14501571655
+    ],
+    [
+     141000,
+     2.7691801181063056,
+     45422.965559244156
+    ],
+    [
+     150400,
+     2.733148653060198,
+     48455.57539272308
+    ],
+    [
+     159800,
+     2.6947654858231544,
+     51477.630467414856
+    ],
+    [
+     169200,
+     2.651976890861988,
+     54496.178995132446
+    ],
+    [
+     178600,
+     2.6086125187575817,
+     57519.67825651169
+    ],
+    [
+     188000,
+     2.5919971764087677,
+     60538.757306575775
+    ]
+   ],
+   "failed": false,
+   "final_heldout_loss": 2.5919971764087677,
+   "refiner_stats": {
+    "entries_consumed": 11930993,
+    "final_step": 188000,
+    "forced_retirements": 0,
+    "learn_fraction": 1.0,
+    "lessons": 6016013,
+    "plan_calls": 192549,
+    "plan_seconds": 279.80878019332886,
+    "score_seconds": 0.0,
+    "scored_entries": 0,
+    "startup_seconds": 0.0,
+    "tokens_in_rows": 12320794624,
+    "tokens_weighted": 12320794624,
+    "weight_sum": 12320794624.0
+   },
+   "steps": 188000,
+   "train_points": [
+    [
+     0,
+     10.995839059352875
+    ],
+    [
+     9400,
+     3.8086175435298197
+    ],
+    [
+     18800,
+     3.1818765516150487
+    ],
+    [
+     28200,
+     3.0900788339408667
+    ],
+    [
+     37600,
+     3.026685652667529
+    ],
+    [
+     47000,
+     3.0038047384571387
+    ],
+    [
+     56400,
+     2.980783380874216
+    ],
+    [
+     65800,
+     2.9684705863127836
+    ],
+    [
+     75200,
+     2.933957821702304
+    ],
+    [
+     84600,
+     2.949013752480076
+    ],
+    [
+     94000,
+     2.923897334047266
+    ],
+    [
+     103400,
+     2.940153092554171
+    ],
+    [
+     112800,
+     2.9205634432869987
+    ],
+    [
+     122200,
+     2.897755880878396
+    ],
+    [
+     131600,
+     2.8440715590038814
+    ],
+    [
+     141000,
+     2.788158844595086
+    ],
+    [
+     150400,
+     2.7550279114344347
+    ],
+    [
+     159800,
+     2.732965913978783
+    ],
+    [
+     169200,
+     2.678792842446941
+    ],
+    [
+     178600,
+     2.6486968897484444
+    ],
+    [
+     188000,
+     2.6150912128082693
+    ]
+   ],
+   "wall_seconds": 60540.46966457367
+  },
+  "source": "run"
+ },
+ "baseline_only": true,
+ "entry_stream": {
+  "doc_index_sha256": "635700f9e0bc3503cb5c0ad9d1fae1c854fcc055e87d032dc510a3cf8ed769e6",
+  "eos_id": 0,
+  "excluded_docs": 6307,
+  "exclusions_sha256": "858ba2b48dd131f4965295b0f39cd4510d46f2d9a0c2c5c8dfeec95677c0804a",
+  "manifest_hash": "bfef73a8aada7237f1d54c6e96eb90f8da5d2f609dfc7ae51c45dbe2487ac88c",
+  "max_entry_tokens": 8192,
+  "n_docs": 15263640,
+  "n_entries": 15470686,
+  "seed": 42,
+  "seq_len": 2048,
+  "split": "train"
+ },
+ "execution": {
+  "force_gc": false,
+  "optproc_enabled": true,
+  "sandbox_mode": "seccomp",
+  "use_amp": true
+ },
+ "failed": true,
+ "provenance": {
+  "from": "docs/notes/refiner-lab-2026-10-10/results/identity_full_188k_pod_baseline.json",
+  "made_by": "scripts/refiner_pod_run.py (RunPod b200-small, 2026-10-11)",
+  "note": "identity arm of refiner_full_top20_b; per-item scores not retained (paired CI unavailable with this baseline)"
+ },
+ "score": 0.0,
+ "student_optimizer": {
+  "lr": 0.002,
+  "origin": "sn125/refiner/student/kairos_b_96fe905a.py",
+  "pinned": true,
+  "sha256": "96fe905a538c32325bf550f0eed66e9ed5289489589752bbe0c8da81771ea383",
+  "weight_decay": 0.04
+ },
+ "suite": {
+  "path": "/workspace/refiner_job/suite.json",
+  "suite_id": "easy_v0",
+  "suite_sha256": "ad25712aa737339d935eeba65d6200a7314424adc304f356c43eff7053d27a44",
+  "tasks": {
+   "arc_easy": 1000,
+   "hellaswag": 1000,
+   "lambada": 1000,
+   "openbookqa": 500,
+   "piqa": 1000,
+   "sciq": 1000
+  }
+ },
+ "task": {
+  "batch_size": 32,
+  "compute_budget_seconds": 72000.0,
+  "data_manifest": "bfef73a8aada7237f1d54c6e96eb90f8da5d2f609dfc7ae51c45dbe2487ac88c",
+  "dataset": "fineweb-edu-shards",
+  "model_config": "lean-llama-360m",
+  "parameter_count": "360M",
+  "seed": 42,
+  "sequence_length": 2048,
+  "task_id": "RF1_smol_360M",
+  "total_steps": 188000
+ },
+ "task_id": "RF1_smol_360M"
+}

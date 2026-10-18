@@ -41,6 +41,8 @@ DEFAULT_RECENT_EVENTS = 500
 DEFAULT_LOGBOOK_TAIL = 200
 MAX_AUDIT_PARSE_BYTES = 64 * 1024 * 1024
 
+# Audit events that move a submission through the round, in emission order.
+# Value: the miner-facing status that event implies.
 _LIVE_STATUS_BY_EVENT = {
     "commit.carryover_readmitted": "readmitted",
     "commit.accepted": "committed",
@@ -53,9 +55,9 @@ _LIVE_STATUS_BY_EVENT = {
     "gate.passed": "gate_passed",
     "evaluation.run_started": "running",
     "evaluation.flake": "relaunching",
-    "cloud_eval.awaiting_box": "awaiting_gpu",
-    "evaluation.deferred": "deferred",
-    "evaluation.finalized": None,
+    "cloud_eval.awaiting_box": "awaiting_gpu",   # polling inventory inside the launch window
+    "evaluation.deferred": "deferred",           # no GPU in the window: carried, credit kept
+    "evaluation.finalized": None,     # take the FSM status carried on the event
 }
 _LIVE_TERMINAL_EVENTS = ("round.finish", "round.exception", "audit.closed")
 
@@ -75,6 +77,7 @@ def _tao(rao: int | None) -> float | None:
     return None if rao is None else round(int(rao) / RAO_PER_TAO, 9)
 
 
+# ── credits ──────────────────────────────────────────────────────────────
 
 
 def build_credits(ledger_path: Path | None, *, recent_events: int = DEFAULT_RECENT_EVENTS
@@ -171,6 +174,7 @@ def build_credits(ledger_path: Path | None, *, recent_events: int = DEFAULT_RECE
     }
 
 
+# ── evaluations ──────────────────────────────────────────────────────────
 
 
 def _queue_from_state(state_path: Path | None) -> dict[str, Any]:
@@ -224,7 +228,7 @@ def _iter_jsonl(path: Path, *, max_bytes: int = MAX_AUDIT_PARSE_BYTES):
     with path.open("rb") as fh:
         if size > max_bytes:
             fh.seek(size - max_bytes)
-            fh.readline()
+            fh.readline()  # drop the partial first line
         for raw in fh:
             raw = raw.strip()
             if not raw:
@@ -380,6 +384,7 @@ def _recent_round_records(rounds_dir: Path | None, *, limit: int) -> list[dict[s
                 "score_record": score if isinstance(score, dict) else None,
             })
         if not rows and isinstance(scored, dict):
+            # Legacy round file without an FSM report: scores + weights only.
             for hk, entry in scored.items():
                 rows.append({
                     "hotkey": hk, "commit_hash": (entry or {}).get("code_hash"),
@@ -418,6 +423,7 @@ def build_evaluations(*, rounds_dir: Path | None, audit_dir: Path | None,
         rounds = [_fail("rounds", exc)]
 
     by_hotkey: dict[str, dict[str, Any]] = {}
+    # Oldest round first so the newest outcome wins.
     for rnd in reversed(rounds):
         for s in rnd.get("submissions") or []:
             hk = s.get("hotkey")
@@ -464,6 +470,7 @@ def build_evaluations(*, rounds_dir: Path | None, audit_dir: Path | None,
     }
 
 
+# ── logbook ──────────────────────────────────────────────────────────────
 
 
 def _tail_lines(path: Path, n: int, *, chunk: int = 64 * 1024) -> list[str]:
@@ -483,7 +490,7 @@ def _tail_lines(path: Path, n: int, *, chunk: int = 64 * 1024) -> list[str]:
             buf = fh.read(step) + buf
     lines = buf.decode("utf-8", errors="replace").splitlines()
     if size > len(buf) and lines:
-        lines = lines[1:]
+        lines = lines[1:]  # first line may be partial
     return lines[-n:]
 
 
@@ -536,6 +543,7 @@ def build_logbook(audit_dir: Path | None, *, tail: int = DEFAULT_LOGBOOK_TAIL,
     }
 
 
+# ── envelope ─────────────────────────────────────────────────────────────
 
 
 def build_ops_snapshot(*, rounds_dir: str | Path | None, audit_dir: str | Path | None,

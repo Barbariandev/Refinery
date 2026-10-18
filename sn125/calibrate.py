@@ -29,6 +29,9 @@ import os
 import statistics
 import time
 
+# B200 SXM bf16 *dense* peak (no 2:4 sparsity) — the realistic ceiling for dense
+# transformer training. NVIDIA's headline ~2.25 PFLOPS is the sparse number;
+# dense bf16 is ~1.1 PFLOPS. MFU here is a sanity gauge, not a contract.
 B200_BF16_DENSE_PEAK_FLOPS = 1.1e15
 
 
@@ -80,6 +83,7 @@ def summarize(step_times: list[float], n_params: int, batch_size: int, seq_len: 
     """
     target_seconds = target_hours * 3600.0
     opt_st = median_step_time(step_times, drop_warmup)
+    # Drive N off the full-iteration wall-clock when available.
     if iter_times:
         st = median_step_time(iter_times, drop_warmup)
         n_measured = len(iter_times)
@@ -90,9 +94,9 @@ def summarize(step_times: list[float], n_params: int, batch_size: int, seq_len: 
     tokens, ratio = chinchilla_ratio(n, batch_size, seq_len, n_params)
     mfu = estimate_mfu(st, n_params, batch_size, seq_len, peak_flops)
     return {
-        "median_step_time_s": round(st, 5),
-        "iteration_time_s": round(st, 5),
-        "optimizer_step_time_s": round(opt_st, 5),
+        "median_step_time_s": round(st, 5),          # FULL iteration wall — drives N (== iteration_time_s)
+        "iteration_time_s": round(st, 5),            # explicit alias
+        "optimizer_step_time_s": round(opt_st, 5),   # opt.step()-only telemetry (NOT the N driver)
         "measured_steps": n_measured,
         "dropped_warmup": min(drop_warmup, n_measured),
         "params": n_params,
@@ -139,6 +143,10 @@ def run_probe(model_config: str, seq_len: int, batch_size: int, probe_steps: int
         raise RuntimeError("run_probe requires CUDA — the throughput numbers are GPU-specific")
 
     t_build = time.time()
+    # Mirror evaluate_submission's production memory regime EXACTLY so the probe's
+    # iter time is the one the real scoring round will see: bf16 params under AMP,
+    # checkpoint long-seq math attention, but drop checkpointing when flash is on
+    # because the streamed attention kernel removes the seq^2 activation wall.
     dtype = torch.bfloat16 if use_amp else None
     flash_on = bool(os.environ.get("SN125_DIAG_FLASH"))
     gc_ckpt = ((use_amp or seq_len >= 1024) and not flash_on) \
@@ -146,8 +154,20 @@ def run_probe(model_config: str, seq_len: int, batch_size: int, probe_steps: int
     model = _build_model(model_config, seed=seed, dtype=dtype,
                          gradient_checkpointing=gc_ckpt, fp8=fp8)
     n_params = sum(p.numel() for p in model.parameters())
+    # torch.compile AFTER param-count (numel reads the original params) and AFTER
+    # checkpointing-enable; compile wraps the module, leaving named_parameters()
+    # (the IPC optimizer contract) delegating to _orig_mod unchanged.
     if compile_model:
         model = torch.compile(model)
+        # TorchDynamo monkeypatches nn.Module.__init__/__setstate__ (a one-time
+        # GLOBAL swap) the first time it compiles a module — which would false-trip
+        # the per-step tamper tripwire. Force that compilation NOW with a
+        # harness-only warm-up forward+backward (matching the real train shape so
+        # the scored graph is also pre-built), then re-baseline the trusted torch
+        # surface. Safe: this runs before ANY miner optimizer code (the optimizer
+        # lives in a separate IPC process), so the refreshed baseline can only
+        # absorb Dynamo's legitimate patches, never miner tampering. See
+        # sandbox.rebaseline_torch_identities for the full contract.
         _warm = torch.randint(0, model.config.vocab_size, (batch_size, seq_len),
                               device="cuda")
         with torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext():
@@ -157,7 +177,8 @@ def run_probe(model_config: str, seq_len: int, batch_size: int, probe_steps: int
         del _warm, _wo
         torch.cuda.synchronize()
         rebaseline_torch_identities()
-    n_batches = min(probe_steps + 1, 64)
+    # +1 batch so step % len(train_data) cycling never reuses a single batch
+    n_batches = min(probe_steps + 1, 64)  # cap memory; loop cycles via step % len
     train_data = _generate_data(batch_size, seq_len, model.config.vocab_size, n_batches, seed)
     eval_data = _generate_data(batch_size, seq_len, model.config.vocab_size, 2, seed + 1)
     optimizer_cls = load_optimizer_sandboxed(ADAMW_SOURCE)
@@ -229,6 +250,7 @@ def main(argv=None):
     if args.out:
         with open(args.out, "w") as f:
             json.dump(result, f, indent=2)
+    # Single machine-parseable line for the cloud launcher.
     print("CALIBRATION_RESULT " + json.dumps(result), flush=True)
     return result
 

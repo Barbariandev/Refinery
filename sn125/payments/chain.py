@@ -45,11 +45,19 @@ from .registry import Transfer
 
 log = logging.getLogger("sn125.payments.chain")
 
+# Stay well inside the lite node's measured ~3000-block event retention so a
+# routine sync never asks the primary endpoint for an evicted block.
 DEFAULT_MAX_SCAN_BLOCKS = 2000
+# ~10 blocks (~2 min) of probabilistic finality is plenty on finney for a
+# payment credit; the operator can raise it.
 DEFAULT_FINALITY_DEPTH = 10
+# Blocks per ``finalized_transfers_to_treasury`` call (backfill granularity).
 DEFAULT_CHUNK_BLOCKS = 500
+# Progress log cadence during a long scan.
 _PROGRESS_EVERY_BLOCKS = 500
+# Finney block time; only used to turn a backfill horizon in hours into blocks.
 BLOCK_SECONDS = 12.0
+# Default archive endpoint (bittensor's ``archive`` network alias).
 DEFAULT_ARCHIVE_NETWORK = "archive"
 
 
@@ -121,12 +129,16 @@ class BittensorChainView:
         self.finality_depth = finality_depth
         self.max_scan_blocks = max_scan_blocks
         self.chunk_blocks = chunk_blocks
+        # Highest finalized block fully scanned for transfers. -1 = nothing yet.
         self._scanned_through = -1
+        # Only an explicit start (backfill) or a restored cursor (restart) may
+        # reach below the prune window; a bare fresh view starts at the window.
         self._explicit_floor = start_block is not None
         if start_block is not None:
             self._scanned_through = max(-1, int(start_block) - 1)
         self._archive_used = 0
 
+    # -- scan cursor (persisted by the registry) -------------------------------
     def scan_cursor(self) -> int:
         """Highest finalized block this view has fully scanned (-1 = none)."""
         return self._scanned_through
@@ -146,14 +158,18 @@ class BittensorChainView:
         """True when every finalized block has been scanned."""
         return self._scanned_through >= self.finalized_head()
 
+    # -- ChainView -----------------------------------------------------------
     def hotkey_owner(self, hotkey: str) -> Optional[str]:
         return self._get_owner(hotkey)
 
     def finalized_transfers_to_treasury(self, since_block: int) -> list[Transfer]:
         finalized_head = self.finalized_head()
+        # Nothing newly finalized beyond what the caller and we already have.
         if finalized_head <= since_block and finalized_head <= self._scanned_through:
             return []
 
+        # Scan only blocks we have neither returned to the caller nor scanned
+        # ourselves — the "accumulate, don't deep-rescan" rule.
         floor = max(since_block, self._scanned_through)
         window_floor = finalized_head - self.max_scan_blocks
         if floor < window_floor:
@@ -191,12 +207,15 @@ class BittensorChainView:
                 events = self._read_events(block, block <= window_floor)
             except Exception as e:
                 if _looks_discarded(e) and self._archive_events is None:
+                    # Unrecoverable from a lite node: skip it loudly rather than
+                    # stall the scanner on this block forever.
                     log.error("block %d is pruned on the primary endpoint and no "
                               "archive endpoint is configured; any treasury deposit "
                               "in it CANNOT be credited automatically (%s)", block, e)
                     self._scanned_through = max(self._scanned_through, block)
                     continue
                 log.warning("failed reading events for block %d: %s", block, e)
+                # Retry the gap before processing any later block.
                 self._scanned_through = max(self._scanned_through, block - 1)
                 out.sort(key=lambda t: (t.block, t.tx_id))
                 return out
@@ -232,6 +251,7 @@ class BittensorChainView:
             self._archive_used += 1
             return self._archive_events(block)
 
+    # -- event parsing -------------------------------------------------------
     def _transfer_to_treasury(self, ev, block: int, idx: int) -> Optional[Transfer]:
         """Map one raw substrate event to a treasury ``Transfer`` or None.
 
@@ -252,11 +272,14 @@ class BittensorChainView:
             return None
         if amount_rao <= 0:
             return None
+        # Substrate events carry no tx hash; (block, event-index) is unique and
+        # stable, which is all the registry's dedup needs.
         ex_idx = _maybe_int(_get(ev, "extrinsic_idx"))
         tag = ex_idx if ex_idx is not None else idx
         return Transfer(tx_id=f"{block}-{tag}", src_coldkey=str(src),
                         amount_rao=amount_rao, block=block)
 
+    # -- real wiring ---------------------------------------------------------
     @classmethod
     def from_subtensor(cls, subtensor, treasury_coldkey: str, *,
                        archive_subtensor_factory: Callable[[], object] | None = None,
@@ -299,6 +322,7 @@ class BittensorChainView:
         )
 
 
+# -- event-shape helpers (module-level, pure) -------------------------------
 
 def _get(obj, key):
     if isinstance(obj, dict):

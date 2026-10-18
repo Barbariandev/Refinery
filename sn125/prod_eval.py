@@ -163,6 +163,8 @@ def _curve_dict(curve):
         "state_multiplier": getattr(curve, "state_multiplier", 1.0),
         "failed": curve.failed,
         "error": curve.error,
+        # §6.3 audit checkpoints (q25/q50/q75/final) — local `path` is consumed by
+        # the validator's R2 upload step, then stripped before publishing.
         "checkpoints": list(getattr(curve, "checkpoints", []) or []),
     }
 
@@ -211,6 +213,10 @@ def _curve_from_dict(task_id: str, d: dict) -> TrainingCurve:
 
 def _load_baseline_curve(path: str, task) -> TrainingCurve:
     payload = json.loads(Path(path).read_text())
+    # Accept a prod-eval result JSON directly (e.g. the pinned genesis result):
+    # its measured run lives under curve_data.curves. Prefer the run's own
+    # curve over curve_data.baseline_curves, which may be a cold-start
+    # placeholder rather than a real measured baseline.
     cd = payload.get("curve_data") or {}
     curves = (payload.get("baseline_curves") or payload.get("curves")
               or cd.get("curves") or cd.get("baseline_curves") or payload)

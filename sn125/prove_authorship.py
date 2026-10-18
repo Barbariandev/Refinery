@@ -3,8 +3,8 @@
 The Refinery publication pipeline credits optimizers to the hotkeys that submitted
 them (round JSONs / attestations record ``code_hash = sha256(source)`` per
 hotkey). This tool lets a miner PROVE, offline and unforgeably, that they
-control the hotkey behind a submission — e.g. to claim authorship on the Refinery
-optimizer paper, or to link a pseudonymous submission to a real identity later.
+control the hotkey behind a submission — e.g. to claim authorship in a Refinery
+publication, or to link a pseudonymous submission to a real identity later.
 
 How it works:
 
@@ -40,6 +40,8 @@ from pathlib import Path
 
 CLAIM_VERSION = 1
 
+# Every field except the signature is signed. Mirrors neuron._signing_payload:
+# canonical JSON (sorted keys) over the claim body.
 _UNSIGNED_FIELDS = frozenset({"signature"})
 
 
@@ -139,6 +141,7 @@ def verify_claim(claim: dict, *, source: str | None = None,
     return report
 
 
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
 
 def _cmd_sign(args) -> int:
@@ -150,7 +153,7 @@ def _cmd_sign(args) -> int:
 
     import bittensor as bt
     wallet = bt.Wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
-    keypair = wallet.hotkey
+    keypair = wallet.hotkey  # decrypts if needed; never leaves this process
 
     claim = build_claim(keypair.ss58_address, code_hash,
                         round_id=args.round_id, statement=args.statement)
@@ -191,7 +194,7 @@ def main(argv=None) -> int:
                         help="claim an already-known sha256 code hash instead of --source")
     p_sign.add_argument("--round-id", default="", help="optional round id context")
     p_sign.add_argument("--statement", default="",
-                        help="optional free-text statement (e.g. name/contact for paper credit)")
+                        help="optional free-text statement (e.g. name/contact for publication credit)")
     p_sign.add_argument("--out", default="", help="write the signed claim JSON here")
 
     p_ver = sub.add_parser("verify", help="Verify a signed authorship claim (no wallet needed)")

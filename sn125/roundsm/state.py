@@ -118,7 +118,7 @@ def load_loop_state(path: str | Path) -> dict[str, Any] | None:
             "recent_rounds": recent,
             "last_weights": weights,
         }
-    except Exception as e:
+    except Exception as e:  # derived state: degrade loudly, do not refuse to start
         log.error("validator state %s is unusable (%s); starting from round 0 with "
                   "an empty carryover. Money and scores are unaffected (ledger and "
                   "round files are the source of truth).", path, e)

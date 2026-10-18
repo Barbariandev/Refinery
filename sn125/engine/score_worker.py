@@ -38,13 +38,18 @@ import tempfile
 from contextlib import nullcontext
 from dataclasses import dataclass
 
+# Match the training harness when this worker is launched directly rather than
+# via score_checkpoint_isolated(), which also sets it in the child env.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch
 import torch.nn as nn
 
+# Generous default: a 1.7B-param f32 checkpoint is ~6.8 GB.  Callers pin this
+# per task; it is a structural cap, not the source-size cap (C8, ~1 MB).
 MAX_CHECKPOINT_BYTES = 16 * 1024**3
 MAX_SHARD_BYTES = 2 * 1024**3
+# Header is JSON metadata only; 100 MB of header is an attack, not a model.
 _MAX_HEADER_BYTES = 100 * 1024**2
 
 _DTYPE_BYTES = {
@@ -173,6 +178,7 @@ def expected_tensors_of(model: nn.Module) -> dict[str, tuple[tuple[int, ...], st
             for name, t in model.state_dict().items()}
 
 
+# ── trainer side (Box A): the only thing it produces ───────────────────────
 
 def export_checkpoint(model: nn.Module, path: str,
                       metadata: dict[str, str] | None = None) -> str:
@@ -208,6 +214,7 @@ def export_eval_shard(batches: list[torch.Tensor], path: str,
     return h.hexdigest()
 
 
+# ── scorer side (Box B) ─────────────────────────────────────────────────────
 
 def _validate_shard(path: str, max_bytes: int = MAX_SHARD_BYTES) -> dict:
     """Validate the raw bytes + tensor inventory of a held-out eval shard.
@@ -304,14 +311,17 @@ def score_checkpoint(checkpoint_path: str, eval_shard_path: str,
                                      expected_tensors=expected)
     from safetensors.torch import load_model
     missing, unexpected = load_model(model, checkpoint_path, strict=True)
-    if missing or unexpected:
+    if missing or unexpected:  # strict=True raises; belt-and-braces
         raise CheckpointRejected(f"state mismatch: missing={missing} unexpected={unexpected}")
 
+    # §5 streaming eval: iterate the shard one batch at a time so a ≥300M-token
+    # held-out split never materializes in host RAM (the historical eval-boundary
+    # OOM). Track peak host RSS + peak CUDA allocation as an observable bound.
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     loss, n_batches = compute_eval_loss(
         model, iter_eval_shard(eval_shard_path), use_amp=use_amp, return_count=True)
-    peak_rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    peak_rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024  # Linux: KB
     cuda_peak_bytes = int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
     if os.environ.get("SN125_PROGRESS"):
         print(f"    [score] eval_loss={loss:.4f} n_batches={n_batches} "
@@ -329,13 +339,14 @@ def score_checkpoint(checkpoint_path: str, eval_shard_path: str,
     }
 
 
+# ── wiring into scoring.py interfaces ───────────────────────────────────────
 
 @dataclass
 class VerifiedScore:
     """Clean-box result + the C3 tripwire against the trainer-reported value."""
     eval_loss: float
     trainer_reported: float | None
-    consistent: bool
+    consistent: bool          # |trainer - clean| <= atol (True when unreported)
     result: dict
 
 
@@ -359,6 +370,7 @@ def apply_verified_loss(curve, result: dict, atol: float = 0.0) -> VerifiedScore
     return VerifiedScore(clean, reported, consistent, result)
 
 
+# ── isolated execution (fresh clean process) ────────────────────────────────
 
 def _worker_env(cache_root: str | None = None) -> dict[str, str]:
     """Minimal env for the scorer subprocess (trusted code, hostile inputs)."""
@@ -370,6 +382,11 @@ def _worker_env(cache_root: str | None = None) -> dict[str, str]:
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     env["PYTHONPATH"] = repo_root
     env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    # Compiler caches for the TRUSTED scorer must never be readable-then-
+    # loadable state the miner could have planted: on container hosts (no
+    # private mount namespace) the miner worker shares /tmp with us, and a
+    # world-writable pre-created /tmp/torchinductor_root would let it feed us
+    # a poisoned kernel. A fresh mkdtemp (0700, root) per scorer run closes it.
     cache_root = cache_root or tempfile.mkdtemp(prefix="sn125_score_cache_")
     for key, sub in (("TORCHINDUCTOR_CACHE_DIR", "torchinductor"),
                      ("TRITON_CACHE_DIR", "triton_cache"),
@@ -421,6 +438,7 @@ def score_checkpoint_isolated(checkpoint_path: str, eval_shard_path: str,
         return payload
 
 
+# ── toy model (tests / CPU smoke path; deterministic, HF-style loss API) ────
 
 class ToyCausalLM(nn.Module):
     """Tiny causal LM exposing the HF call contract ``model(x, labels=x).loss``."""
@@ -453,7 +471,7 @@ def build_model_from_spec(model_spec: str, device: str = "cpu",
     kind, _, arg = model_spec.partition(":")
     if kind == "hf":
         from ..training import _build_model
-        return _build_model(arg, seed=0, dtype=dtype)
+        return _build_model(arg, seed=0, dtype=dtype)  # weights come from checkpoint
     if kind == "toy":
         kwargs = json.loads(arg) if arg else {}
         model = ToyCausalLM(**kwargs).to(device)
@@ -476,6 +494,8 @@ def _main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.device.startswith("cuda"):
+        # Same determinism posture as the harness eval path: default is replayable
+        # math SDPA, production may opt into flash/non-determinism for throughput.
         torch.use_deterministic_algorithms(True, warn_only=False)
         torch.backends.cudnn.benchmark = False
         if os.environ.get("SN125_DIAG_NONDET"):

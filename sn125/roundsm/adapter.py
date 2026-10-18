@@ -37,28 +37,68 @@ from typing import Any, Callable
 from .audit import audit_emit, looks_like_crash, payload_record
 from .driver import EvalResult, GateResult
 
+# Source-byte ceiling — standardized to the gate's total-payload cap
+# (gate.MAX_TOTAL_BYTES, ~1 MB) so intake never rejects a submission the gate
+# would accept. Mirrors scoring.max_source_bytes and the neuron fetch guard.
+# A reveal larger than this is dropped (it stays UNREVEALED and is consumed
+# without refund at close — same as legacy).
 MAX_SOURCE_BYTES = 1_048_576
 
+# A "box never came up" failure is a TRANSIENT provisioning flake (§2.4): the same
+# commitment relaunches at $0, and 3 consecutive flakes pause the round (it never
+# silently shrinks). The driver routes these through ``record_provisioning_flake``,
+# so they are distinct from the terminal ``infra_dq`` markers below — a flake retries
+# and may still score, where infra_dq concedes + refunds.
 FLAKE_ERROR_MARKERS: tuple[str, ...] = (
     "rental_provisioning_failed",
     "not_started",
+    # Box failed the pre-eval throughput gate (cloud._throughput_gate): the
+    # hardware is outside the pinned speed band, so the fixed wall-clock budget
+    # would deliver the wrong amount of compute (a slow box starves miners'
+    # schedules; a fast box inflates the score and poisons the frontier
+    # ratchet). Miner code never ran — relaunch on a fresh box. Checked BEFORE
+    # the infra markers: the stage() wrapper also prefixes "[pre-eval infra]",
+    # but an out-of-band box is retryable, not terminal.
     "box_throughput_floor",
     "box_throughput_ceiling",
+    # Post-eval drift probe (cloud._drift_gate): the box's own probe speed
+    # moved beyond the band during the run (throttling / noisy neighbor /
+    # probe sandbagging), so the delivered compute is not the granted compute.
+    # The finished score is quarantined and the SAME submission relaunches on
+    # a fresh box — retryable, never a miner DQ (the box, not the optimizer,
+    # is at fault).
     "box_throughput_drift",
+    # The canonical B200 SKU had zero inventory when the rental was attempted
+    # (cloud.CapacityWait surfaced inside evaluate_submission). No box, no miner
+    # code: never a miner fault. Incident 2026-09-08 (round_000000_1788861194):
+    # this string fell through to the ambiguous ``dq`` branch and burned two
+    # credits for want of GPUs. The driver re-runs the capacity gate before
+    # retrying, so this reads as a retryable flake, not a strike.
     "capacity_wait",
     "capacity-aware delay",
     "b200 capacity",
+    "[pre-eval infra]",
 )
 
+# A failed cloud result is OUR infrastructure fault (-> infra_dq, credit refunded)
+# only when its error string carries one of these markers. Everything else that
+# `failed` is treated as MINER fault (-> dq, fee burned): the SPEC §2.4 / E4 stance
+# is "no refund-fraud surface", so we refund only when we are confident the failure
+# was ours, never on an ambiguous one. These are terminal (the box DID run but the
+# eval could not complete): a 20h timeout or a spend-cap kill won't recover on a
+# relaunch, so we refund rather than retry. (rc=139 = SIGSEGV is a box fault, not the
+# miner's code; the cloud layer is meant to relaunch it once first — carry-forward.)
 INFRA_ERROR_MARKERS: tuple[str, ...] = (
     "timeout_exceeded",
-    "[critical]",
+    "[critical]",          # cost kill-switch / daily spend cap
     "no json result",
-    "rc=139",
-    "[pre-eval infra]",
-    "network lockdown",
+    "rc=139",              # SIGSEGV — box fault, not miner code
+    "network lockdown",    # egress lockdown fail-closed — miner code never ran
 )
 
+# Sentinel score used throughout cloud.py for "no real score" (failed runs and
+# parse gaps). A not-failed result still carrying it means the bench output had no
+# parseable "yours" line — a harness/parse gap, our fault, not a miner score.
 _NO_SCORE_SENTINEL = -1.0
 
 
@@ -195,6 +235,8 @@ def make_source_gate(
     max_bytes: int = MAX_SOURCE_BYTES,
     allow_native: bool = False,
     validate_fn: Callable[..., list[str]] | None = None,
+    refiner_enabled: bool = False,
+    refiner_disabled_reason: str | None = None,
 ) -> Callable[[bytes], GateResult]:
     """Build ``gate(payload) -> GateResult`` over the full pre-build gate
     (``gate.validate_single_source``: C2 binary/PTX/NUL screens + C8 size caps
@@ -218,13 +260,25 @@ def make_source_gate(
 
         return gate
 
-    from ..gate import validate_single_source
+    from ..gate import validate_single_source  # lazy: no heavy import at load
+    from ..refiner.submission import EnvelopeError, gate_envelope, looks_like_envelope, parse_envelope
 
     def gate(payload: bytes) -> GateResult:
         try:
             source = payload.decode("utf-8")
         except UnicodeDecodeError:
             return GateResult(False, "source not valid UTF-8")
+        if looks_like_envelope(source):
+            # Refiner-task submission (Challenge 2): its own source gate.
+            if not refiner_enabled:
+                return GateResult(False, refiner_disabled_reason
+                                  or "refiner task is not enabled on this validator")
+            try:
+                env = parse_envelope(source)
+            except EnvelopeError as e:
+                return GateResult(False, f"refiner envelope: {e}")
+            ok, why = gate_envelope(env)
+            return GateResult(ok, why)
         res = validate_single_source(source)
         if not res.ok:
             return GateResult(False, "; ".join(res.reasons[:3]))
@@ -273,6 +327,7 @@ def classify_cloud_result(res: dict, *, ambiguous: str = "dq") -> EvalResult:
     if not failed:
         if isinstance(score, (int, float)) and float(score) > _NO_SCORE_SENTINEL:
             return EvalResult("scored", score=float(score))
+        # rc==0 but no parseable score line — harness/parse gap, our fault.
         return EvalResult("infra_dq", reason="no parseable score (harness gap)")
 
     if any(m in err for m in FLAKE_ERROR_MARKERS) or no_box_ran(res):
@@ -280,6 +335,13 @@ def classify_cloud_result(res: dict, *, ambiguous: str = "dq") -> EvalResult:
 
     if any(m in err for m in INFRA_ERROR_MARKERS):
         return EvalResult("infra_dq", reason=res.get("error", "infra failure"))
+
+    # refiner-eval attributes every failure: only protocol violations, refiner
+    # process failures and a diverged loss are the miner's. Anything it marks
+    # as the harness's (suite, baseline, entry stream, bench scoring, sandbox)
+    # refunds the credit instead of burning it.
+    if res.get("fault") == "harness":
+        return EvalResult("infra_dq", reason=res.get("error", "harness fault"))
 
     if ambiguous == "infra_dq":
         return EvalResult("infra_dq", reason=res.get("error", "unclassified failure"))
@@ -338,7 +400,7 @@ def make_cloud_evaluator(
             try:
                 on_result(commit_hash, res)
             except Exception:
-                pass
+                pass  # dashboard ferrying is best-effort, never fails the eval
         verdict = classify_cloud_result(res, ambiguous=ambiguous)
         err = str(res.get("error", ""))
         audit_emit(audit, "cloud_eval.result", commit_hash=commit_hash,

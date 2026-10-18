@@ -84,6 +84,9 @@ class SegmentError(RuntimeError):
 
 
 # ── miner opt-state encoding: tensors out-of-band, structure as JSON ─────────
+# Wrapper keys are single-purpose markers; scalars pass through raw.  A plain
+# dict/tuple can never collide with a marker because every container is
+# wrapped before its children are emitted.
 
 def _encode_state(obj, sink: dict[str, torch.Tensor], counter: list[int]):
     if torch.is_tensor(obj):
@@ -128,6 +131,7 @@ def _decode_state(node, tensors: dict[str, torch.Tensor], device, used: set[str]
     return node
 
 
+# ── RNG capture (harness side + miner process) ───────────────────────────────
 
 def _capture_rng(opt, device: torch.device) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
     tensors = {"rng/harness/torch": torch.get_rng_state()}
@@ -180,6 +184,7 @@ def _restore_rng(opt, tensors: dict[str, torch.Tensor], meta: dict[str, str],
         np.random.set_state((ns[0], np.array(ns[1], dtype=np.uint32), ns[2], ns[3], ns[4]))
 
 
+# ── checkpoint I/O ───────────────────────────────────────────────────────────
 
 def save_segment_checkpoint(path: str, model: nn.Module, opt, step: int,
                             train_losses: list[float] | None = None,
@@ -264,6 +269,7 @@ def load_segment_checkpoint(path: str, model: nn.Module, opt,
         raise CheckpointRejected(f"bad step metadata: {e}") from e
 
 
+# ── segment execution (exact mirror of train_and_eval's inner step) ──────────
 
 @dataclass
 class SegmentSpec:
@@ -406,6 +412,7 @@ def run_segmented(model_factory, opt_factory, train_data: list[torch.Tensor],
     return results
 
 
+# ── random re-verification ───────────────────────────────────────────────────
 
 @dataclass
 class VerificationReport:
@@ -414,7 +421,7 @@ class VerificationReport:
     end_step: int
     claimed_digest: str
     recomputed_digest: str
-    mismatches: list[str] = field(default_factory=list)
+    mismatches: list[str] = field(default_factory=list)  # tensor names / meta keys
 
 
 def compare_checkpoints(claimed_path: str, recomputed_path: str) -> list[str]:
