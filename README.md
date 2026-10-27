@@ -67,8 +67,8 @@ results will test those beliefs.
 We believe this benchmark is our best practical way to measure optimizer
 performance within the resources of an evaluation run. Transfer to other
 models, datasets and training scales still needs to be measured. Data selection
-and other training components are future research directions, not current
-mining tasks.
+is now Challenge 2; other training components are future research directions,
+not current mining tasks.
 
 ## What miners do
 
@@ -113,9 +113,9 @@ before spending: historical reference numbers are not a live target.
 
 Challenge 2 trains the same 360M student with a pinned optimizer under the same
 budget and scores the checkpoint on a benchmark suite. A refiner qualifies by
-beating the current frontier by more than 0.02 suite points (the pinned
-identity baseline until a refiner clears it), confirmed by a second run at the
-validator's cost ([docs/REFINER_TASK.md](docs/REFINER_TASK.md) §9).
+beating the current frontier (the pinned identity baseline until a refiner
+clears it) by more than the adaptive bar (floor 0.02 suite points), confirmed
+by a second run at the validator's cost ([docs/REFINER_TASK.md](docs/REFINER_TASK.md) §9).
 
 ## Rewards follow progress
 
