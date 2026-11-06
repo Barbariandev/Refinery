@@ -77,6 +77,15 @@ FLAKE_ERROR_MARKERS: tuple[str, ...] = (
     "capacity_wait",
     "capacity-aware delay",
     "b200 capacity",
+    # Any stage before "eval" (ssh, setup, shard staging, refiner inputs,
+    # egress lockdown) is VALIDATOR infrastructure; cloud._provision_and_run
+    # tags its failures — including a pre-eval SSH timeout — with this prefix.
+    # Miner code has not run, the box is torn down, and the same commitment
+    # relaunches on a fresh box under the driver's attempt/launch-window
+    # bounds. Until 2026-10-12 this marker was terminal (infra_dq): a transient
+    # Hub rate limit during shard staging then cost the miner the whole round
+    # — 12 of the 14 infra_dq verdicts in rounds 0-28, rising with the number
+    # of boxes launched together.
     "[pre-eval infra]",
 )
 
@@ -262,6 +271,7 @@ def make_source_gate(
 
     from ..gate import validate_single_source  # lazy: no heavy import at load
     from ..refiner.submission import EnvelopeError, gate_envelope, looks_like_envelope, parse_envelope
+    from ..review import review_rejection
 
     def gate(payload: bytes) -> GateResult:
         try:
@@ -277,6 +287,11 @@ def make_source_gate(
                 env = parse_envelope(source)
             except EnvelopeError as e:
                 return GateResult(False, f"refiner envelope: {e}")
+            # Operator review verdict (sn125/review.py): a submission rejected
+            # under the decisions-from-text rule is never launched.
+            why = review_rejection(payload)
+            if why:
+                return GateResult(False, f"review: {why} (docs/REFINER_TASK.md §3)")
             ok, why = gate_envelope(env)
             return GateResult(ok, why)
         res = validate_single_source(source)

@@ -59,6 +59,7 @@ from pathlib import Path
 
 from .. import settings
 from ..config import next_round_start, round_hold_until
+from ..review import review_rejection
 from .adapter import (
     classify_cloud_result,
     make_commit_collector,
@@ -325,6 +326,16 @@ def _make_cloud_batch(validator, round_id: str, sink: dict[str, dict],
         started = time.time()
         rf = refiner_job_for(payload, refiner_cfg)
         if rf is not None:
+            # Operator review verdict (sn125/review.py), re-read at every
+            # launch: it covers the initial run through the gate already, and
+            # this check extends it to confirmation re-runs of a pending
+            # frontier candidate. A rejected submission never rents a box.
+            why = review_rejection(payload)
+            if why:
+                audit_emit(audit, "refiner.review_rejected", commit_hash=commit_hash,
+                           sub_uid=sub_uid, attempt=attempt, reason=why)
+                return commit_hash, None, EvalResult("dq", reason=f"review: {why} "
+                                                     "(docs/REFINER_TASK.md §3)")
             return _attempt_refiner(commit_hash, payload, rf[0], rf[1], sub_uid, attempt, started)
         audit_emit(audit, "cloud_eval.start", commit_hash=commit_hash,
                    sub_uid=sub_uid, mode=mode, attempt=attempt,

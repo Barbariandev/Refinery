@@ -12,6 +12,8 @@ the plan protocol documented in lessons.py.
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import time
 from dataclasses import dataclass
 
@@ -46,13 +48,14 @@ class FeederStats:
 
 
 class _WindowEntry:
-    __slots__ = ("wid", "entry", "born", "scored")
+    __slots__ = ("wid", "entry", "born", "scored", "doc_label")
 
-    def __init__(self, wid, entry, born):
+    def __init__(self, wid, entry, born, doc_label):
         self.wid = wid
         self.entry = entry
         self.born = born
         self.scored = False
+        self.doc_label = doc_label
 
 
 class LessonFeeder:
@@ -72,6 +75,12 @@ class LessonFeeder:
                                        else caps.get("wants_token_losses", False))
         self.isolated = isolated  # planner is a RefProcHandle (already parses/validates)
         self._window: list[_WindowEntry] = []
+        # Per-run key for the window's doc labels (docs/REFINER_TASK.md §3):
+        # the planner sees a keyed hash of the stream's document index, never
+        # the index itself. Stable within the run (chunks of one document share
+        # their label), drawn fresh every run — a label identifies no corpus
+        # document, so nothing keyed to document identity survives a run.
+        self._doc_key = os.urandom(16)
         self._next_wid = 0
         self._next_entry = 0
         self._rows: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -83,11 +92,18 @@ class LessonFeeder:
         self._closed = False
 
     # ── window management ────────────────────────────────────────────────
+    def _doc_label(self, doc_id: int) -> int:
+        """The per-run random label published as the window's ``doc_id``."""
+        h = hashlib.blake2b(int(doc_id).to_bytes(8, "little"), key=self._doc_key,
+                            digest_size=8).digest()
+        return int.from_bytes(h, "little") >> 1   # non-negative, 63-bit
+
     def _refill(self):
         while len(self._window) < self.window_entries:
             ent = self.stream[self._next_entry]
             self._next_entry += 1
-            we = _WindowEntry(self._next_wid, ent, self.stats.plan_calls)
+            we = _WindowEntry(self._next_wid, ent, self.stats.plan_calls,
+                              self._doc_label(ent.doc_id))
             self._next_wid += 1
             self._window.append(we)
             if self.wants_token_losses:
@@ -167,7 +183,7 @@ class LessonFeeder:
 
     # ── planning ─────────────────────────────────────────────────────────
     def _window_payload(self) -> list[dict]:
-        return [{"wid": we.wid, "doc_id": we.entry.doc_id, "chunk": we.entry.chunk,
+        return [{"wid": we.wid, "doc_id": we.doc_label, "chunk": we.entry.chunk,
                  "n_chunks": we.entry.n_chunks, "tokens": we.entry.tokens} for we in self._window]
 
     def _plan_once(self, ctx: dict, score_fn) -> PlanResult:

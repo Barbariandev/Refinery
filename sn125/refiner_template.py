@@ -50,7 +50,9 @@ RULES (enforced; see docs/REFINER_TASK.md):
 
 PLAN PROTOCOL
   window:  list of {"wid": int, "doc_id": int, "chunk": int, "n_chunks": int,
-                    "tokens": LongTensor[n]}        (the entries you can draw from)
+                    "tokens": LongTensor[n]}        (the entries you can draw from;
+                    doc_id is a random per-run label — chunks of one document
+                    share it within a run, it identifies no corpus document)
   signals: {"token_losses": {wid: FloatTensor[n]}}  (present iff wants_token_losses;
                     entry t = student CE of predicting token t; t=0 is 0)
   ctx:     {"step", "elapsed_s", "elapsed_frac", "tokens_trained", "seq_len",

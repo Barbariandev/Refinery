@@ -65,7 +65,10 @@ Refiner.plan(window, signals, ctx) -> {"lessons": [...], "retire": [...], "resco
 
 - `window`: list of `{"wid", "doc_id", "chunk", "n_chunks", "tokens": LongTensor[n]}`.
   Entries are whole documents; documents longer than 8192 tokens are cut
-  into consecutive chunks, each its own entry.
+  into consecutive chunks, each its own entry. `doc_id` is a **random per-run
+  label**: stable within one run (chunks of one document share it), drawn
+  fresh every run, so it identifies no corpus document and cannot key
+  anything precomputed over the corpus.
 - `signals["token_losses"][wid]`: `FloatTensor[n]`, entry `t` = student CE of
   predicting token `t` (position 0 is 0). Present only when
   `CAPABILITIES["wants_token_losses"]` is true; computed by the harness when an
@@ -92,6 +95,22 @@ Limits: window ≤ 256 entries (`CAPABILITIES["window_entries"]`, default 16);
 `plan()` call over the deadline (default 120 s) kills the refiner process and
 fails the run. Weights: ≤ 100M parameters, ≤ 450 MB, dtypes f32/f16/bf16/
 int*/bool, validated structurally before loading (`validate_refiner_weights`).
+
+**Decisions must come from the text (review rule).** A refiner must make its
+decisions from the text it is shown in the window. A submission — source or
+weights — must not contain data keyed to specific documents of the training
+corpus, whether by document ID, content hash, fingerprint or equivalent:
+pre-scoring the corpus at home and shipping the answers is not refining.
+Corpus-level statistics remain fully legal — token and n-gram frequencies,
+domain priors, learned scorers, anything that generalizes to text the refiner
+has not seen. Enforcement is operator review, in the open: new submissions
+are reviewed after reveal; a submission that violates the rule is not run
+(and a pending frontier candidate is not confirmed), its evaluation credit is
+not refunded — the same footing as any other gate failure — and every
+rejection is published in the round record with its reason
+(`sn125/review.py`; verdicts in `SN125_REFINER_REVIEW_FILE`, default
+`sn125/rounds/refiner_review.json`). The rule applies to submissions from its
+announcement forward; nothing is reclassified retroactively.
 
 ## 4. Training semantics
 
@@ -253,6 +272,15 @@ Known gaps, to resolve before this task carries emission:
   that look like the benchmark" cheap; decontamination removes verbatim text,
   not look-alikes. A cap on entries consumed per token trained is the direct
   limit if one is wanted;
+- **the pool is fixed and public, so it can be pre-scored at home**: a
+  submission demonstrated this with a per-document score table keyed by
+  `doc_id` over all 15.26 M documents. Addressed (2026-11): `doc_id` is now a
+  random per-run label, and the decisions-from-text review rule (§3) bans
+  document-keyed data outright, with operator review and published rejections
+  as enforcement. Content-hash keying is technically possible within the
+  weight cap, which is why the rule and review — not the label change — are
+  the wall. Moving the task to fresh per-round samples remains the structural
+  fix, deferred (§10);
 - **schedule vs clock**: the pinned student optimizer's cooldown is keyed to
   `step / total_steps` while the run stops on wall clock, so an arm that
   completes fewer steps is also cut earlier on the cooldown (and an arm with

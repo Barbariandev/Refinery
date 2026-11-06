@@ -72,6 +72,15 @@ a literal). Everything a refiner emits is `(wid, start, end)` spans plus a
 weight tensor; the harness assembles the batches, the student never sees your
 code.
 
+**One rule on what the weights may hold** (docs/REFINER_TASK.md §3): your
+refiner must decide from the text in its window. Data keyed to specific corpus
+documents — document IDs, content hashes, fingerprints — is banned and
+rejected at review, with the reason published. Corpus-level statistics (token
+and n-gram frequencies, domain priors, learned scorers — both reference
+refiners above) are fully legal. The window's `doc_id` is a random per-run
+label: chunks of one document share it within a run, and it means nothing
+across runs.
+
 ## 3. How to submit
 
 The miner serves one string — a canonical JSON envelope — through the same
